@@ -118,6 +118,11 @@ jobs:
       uses: actions/upload-artifact@v3
       with:
         path: artifacts
+    - name: Upload release artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: macos
+        path: release/*.dmg
 
   linux:
     needs: lint
@@ -180,6 +185,11 @@ jobs:
       uses: actions/upload-artifact@v3
       with:
         path: artifacts
+    - name: Upload release artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: linux
+        path: release/*.deb
 
   windows:
     needs: lint
@@ -253,6 +263,11 @@ jobs:
       uses: actions/upload-artifact@v3
       with:
         path: artifacts
+    - name: Upload release artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: windows
+        path: release/*.exe
 
   sticker-creator:
     name: Sticker Creator
