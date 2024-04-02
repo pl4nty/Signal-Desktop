@@ -420,12 +420,16 @@
         ".node"
       ],
       "target": [
-        "nsis"
+        "nsis",
+        "appx"
       ]
     },
     "nsis": {
       "deleteAppDataOnUninstall": true,
       "differentialPackage": true
+    },
+    "appx": {
+      "applicationId": "org.whispersystems.signaldesktop"
     },
     "linux": {
       "category": "Network;InstantMessaging;Chat",

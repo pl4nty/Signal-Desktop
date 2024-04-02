@@ -267,7 +267,9 @@ jobs:
       uses: actions/upload-artifact@v3
       with:
         name: windows
-        path: release/*.exe
+        path: |
+          release/*.exe
+          release/*.appx
 
   sticker-creator:
     name: Sticker Creator
