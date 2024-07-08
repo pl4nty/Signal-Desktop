@@ -266,7 +266,11 @@ export class Bootstrap {
     return path.join(this.backupPath, fileName);
   }
 
-  public async unlink(): Promise<void> {
+  public eraseStorage(): Promise<void> {
+    return this.resetAppStorage();
+  }
+
+  private async resetAppStorage(): Promise<void> {
     assert(
       this.storagePath !== undefined,
       'Bootstrap has to be initialized first, see: bootstrap.init()'
@@ -299,6 +303,18 @@ export class Bootstrap {
     debug('linking');
 
     const app = await this.startApp(extraConfig);
+
+    const window = await app.getWindow();
+    const qrCode = window.locator(
+      '.module-InstallScreenQrCodeNotScannedStep__qr-code__code'
+    );
+    const relinkButton = window.locator('.LeftPaneDialog__icon--relink');
+    await qrCode.or(relinkButton).waitFor();
+    if (await relinkButton.isVisible()) {
+      debug('unlinked, clicking left pane button');
+      await relinkButton.click();
+      await qrCode.waitFor();
+    }
 
     const provision = await this.server.waitForProvision();
 
@@ -349,7 +365,6 @@ export class Bootstrap {
     debug('starting the app');
 
     const { port } = this.server.address();
-    const config = await this.generateConfig(port, extraConfig);
 
     let startAttempts = 0;
     const MAX_ATTEMPTS = 4;
@@ -361,11 +376,16 @@ export class Bootstrap {
           `App failed to start after ${MAX_ATTEMPTS} times, giving up`
         );
       }
+
+      // eslint-disable-next-line no-await-in-loop
+      const config = await this.generateConfig(port, extraConfig);
+
       const startedApp = new App({
         main: ELECTRON,
         args: [CI_SCRIPT],
         config,
       });
+
       try {
         // eslint-disable-next-line no-await-in-loop
         await startedApp.start();
@@ -375,6 +395,9 @@ export class Bootstrap {
           `Failed to start the app, attempt ${startAttempts}, retrying`,
           error
         );
+
+        // eslint-disable-next-line no-await-in-loop
+        await this.resetAppStorage();
         continue;
       }
 
@@ -622,6 +645,7 @@ export class Bootstrap {
       storageProfile: 'mock',
       serverUrl: url,
       storageUrl: url,
+      sfuUrl: url,
       cdn: {
         '0': url,
         '2': url,

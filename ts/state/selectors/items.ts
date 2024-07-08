@@ -242,3 +242,9 @@ export const getShowStickerPickerHint = createSelector(
     return state.showStickerPickerHint ?? false;
   }
 );
+
+export const getLocalDeleteWarningShown = createSelector(
+  getItems,
+  (state: ItemsStateType): boolean =>
+    Boolean(state.localDeleteWarningShown ?? false)
+);

@@ -22,6 +22,16 @@ export const isShowingAnyModal = createSelector(
     })
 );
 
+export const getCallLinkEditModalRoomId = createSelector(
+  getGlobalModalsState,
+  ({ callLinkEditModalRoomId }) => callLinkEditModalRoomId
+);
+
+export const getCallLinkAddNameModalRoomId = createSelector(
+  getGlobalModalsState,
+  ({ callLinkAddNameModalRoomId }) => callLinkAddNameModalRoomId
+);
+
 export const getContactModalState = createSelector(
   getGlobalModalsState,
   ({ contactModalState }) => contactModalState
@@ -60,4 +70,14 @@ export const getProfileEditorHasError = createSelector(
 export const getProfileEditorInitialEditState = createSelector(
   getGlobalModalsState,
   ({ profileEditorInitialEditState }) => profileEditorInitialEditState
+);
+
+export const getEditNicknameAndNoteModalProps = createSelector(
+  getGlobalModalsState,
+  ({ editNicknameAndNoteModalProps }) => editNicknameAndNoteModalProps
+);
+
+export const getNotePreviewModalProps = createSelector(
+  getGlobalModalsState,
+  ({ notePreviewModalProps }) => notePreviewModalProps
 );

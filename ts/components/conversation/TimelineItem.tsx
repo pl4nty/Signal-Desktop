@@ -20,6 +20,8 @@ import type { PropsDataType as DeliveryIssueProps } from './DeliveryIssueNotific
 import { DeliveryIssueNotification } from './DeliveryIssueNotification';
 import type { PropsData as ChangeNumberNotificationProps } from './ChangeNumberNotification';
 import { ChangeNumberNotification } from './ChangeNumberNotification';
+import type { PropsData as JoinedSignalNotificationProps } from './JoinedSignalNotification';
+import { JoinedSignalNotification } from './JoinedSignalNotification';
 import type { PropsData as TitleTransitionNotificationProps } from './TitleTransitionNotification';
 import { TitleTransitionNotification } from './TitleTransitionNotification';
 import type { CallingNotificationType } from '../../util/callingNotification';
@@ -98,6 +100,10 @@ type ChangeNumberNotificationType = {
   type: 'changeNumberNotification';
   data: ChangeNumberNotificationProps;
 };
+type JoinedSignalNotificationType = {
+  type: 'joinedSignalNotification';
+  data: JoinedSignalNotificationProps;
+};
 type TitleTransitionNotificationType = {
   type: 'titleTransitionNotification';
   data: TitleTransitionNotificationProps;
@@ -156,6 +162,7 @@ export type TimelineItemType = (
   | GroupNotificationType
   | GroupV1MigrationType
   | GroupV2ChangeType
+  | JoinedSignalNotificationType
   | MessageType
   | PhoneNumberDiscoveryNotificationType
   | ProfileChangeNotificationType
@@ -177,10 +184,12 @@ type PropsLocalType = {
   item?: TimelineItemType;
   id: string;
   isBlocked: boolean;
+  isGroup: boolean;
   isNextItemCallingNotification: boolean;
   isTargeted: boolean;
   targetMessage: (messageId: string, conversationId: string) => unknown;
   shouldRenderDateHeader: boolean;
+  onOpenEditNicknameAndNoteModal: (contactId: string) => void;
   onOpenMessageRequestActionsConfirmation(state: MessageRequestState): void;
   platform: string;
   renderContact: SmartContactRendererType<JSX.Element>;
@@ -216,9 +225,11 @@ export const TimelineItem = memo(function TimelineItem({
   i18n,
   id,
   isBlocked,
+  isGroup,
   isNextItemCallingNotification,
   isTargeted,
   item,
+  onOpenEditNicknameAndNoteModal,
   onOpenMessageRequestActionsConfirmation,
   onOutgoingAudioCallInConversation,
   onOutgoingVideoCallInConversation,
@@ -317,6 +328,14 @@ export const TimelineItem = memo(function TimelineItem({
           i18n={i18n}
         />
       );
+    } else if (item.type === 'joinedSignalNotification') {
+      notification = (
+        <JoinedSignalNotification
+          {...reducedProps}
+          {...item.data}
+          i18n={i18n}
+        />
+      );
     } else if (item.type === 'titleTransitionNotification') {
       notification = (
         <TitleTransitionNotification
@@ -383,6 +402,7 @@ export const TimelineItem = memo(function TimelineItem({
           {...reducedProps}
           {...item.data}
           i18n={i18n}
+          onOpenEditNicknameAndNoteModal={onOpenEditNicknameAndNoteModal}
         />
       );
     } else if (item.type === 'paymentEvent') {
@@ -398,6 +418,7 @@ export const TimelineItem = memo(function TimelineItem({
         <MessageRequestResponseNotification
           {...item.data}
           i18n={i18n}
+          isGroup={isGroup}
           isBlocked={isBlocked}
           onOpenMessageRequestActionsConfirmation={
             onOpenMessageRequestActionsConfirmation

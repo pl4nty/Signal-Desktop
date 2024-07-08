@@ -9,7 +9,6 @@ import type {
   GroupIncomingCall,
 } from '../../components/CallManager';
 import { CallManager } from '../../components/CallManager';
-import type { SafetyNumberProps } from '../../components/SafetyNumberChangeDialog';
 import { isConversationTooBigToRing as getIsConversationTooBigToRing } from '../../conversations/isConversationTooBigToRing';
 import * as log from '../../logging/log';
 import { calling as callingService } from '../../services/calling';
@@ -39,33 +38,27 @@ import { strictAssert } from '../../util/assert';
 import { callLinkToConversation } from '../../util/callLinks';
 import { callingTones } from '../../util/callingTones';
 import { isGroupCallRaiseHandEnabled } from '../../util/isGroupCallRaiseHandEnabled';
-import { isGroupCallReactionsEnabled } from '../../util/isGroupCallReactionsEnabled';
 import { missingCaseError } from '../../util/missingCaseError';
 import { useAudioPlayerActions } from '../ducks/audioPlayer';
 import { getActiveCall, useCallingActions } from '../ducks/calling';
 import type { ConversationType } from '../ducks/conversations';
-import { useToastActions } from '../ducks/toast';
 import type { StateType } from '../reducer';
 import { getHasInitialLoadCompleted } from '../selectors/app';
-import { getPreferredBadgeSelector } from '../selectors/badges';
 import {
   getAvailableCameras,
   getCallLinkSelector,
   getIncomingCall,
 } from '../selectors/calling';
 import { getConversationSelector, getMe } from '../selectors/conversations';
-import { getIntl, getTheme } from '../selectors/user';
+import { getIntl } from '../selectors/user';
 import { SmartCallingDeviceSelection } from './CallingDeviceSelection';
-import { SmartSafetyNumberViewer } from './SafetyNumberViewer';
 import { renderEmojiPicker } from './renderEmojiPicker';
 import { renderReactionPicker } from './renderReactionPicker';
+import { isSharingPhoneNumberWithEverybody as getIsSharingPhoneNumberWithEverybody } from '../../util/phoneNumberSharingMode';
+import { useGlobalModalActions } from '../ducks/globalModals';
 
 function renderDeviceSelection(): JSX.Element {
   return <SmartCallingDeviceSelection />;
-}
-
-function renderSafetyNumberViewer(props: SafetyNumberProps): JSX.Element {
-  return <SmartSafetyNumberViewer {...props} />;
 }
 
 const getGroupCallVideoFrameSource =
@@ -216,10 +209,10 @@ const mapStateToActiveCallProp = (
       } satisfies ActiveDirectCallType;
     case CallMode.Group:
     case CallMode.Adhoc: {
-      const conversationsWithSafetyNumberChanges: Array<ConversationType> = [];
       const groupMembers: Array<ConversationType> = [];
       const remoteParticipants: Array<GroupCallRemoteParticipantType> = [];
       const peekedParticipants: Array<ConversationType> = [];
+      const pendingParticipants: Array<ConversationType> = [];
       const conversationsByDemuxId: ConversationsByDemuxIdType = new Map();
       const { localDemuxId } = call;
       const raisedHands: Set<number> = new Set(call.raisedHands ?? []);
@@ -233,6 +226,7 @@ const mapStateToActiveCallProp = (
           deviceCount: 0,
           maxDevices: Infinity,
           acis: [],
+          pendingAcis: [],
         },
       } = call;
 
@@ -290,22 +284,6 @@ const mapStateToActiveCallProp = (
         }
       });
 
-      for (
-        let i = 0;
-        i < activeCallState.safetyNumberChangedAcis.length;
-        i += 1
-      ) {
-        const aci = activeCallState.safetyNumberChangedAcis[i];
-
-        const remoteConversation = conversationSelectorByAci(aci);
-        if (!remoteConversation) {
-          log.error('Remote participant has no corresponding conversation');
-          continue;
-        }
-
-        conversationsWithSafetyNumberChanges.push(remoteConversation);
-      }
-
       for (let i = 0; i < peekInfo.acis.length; i += 1) {
         const peekedParticipantAci = peekInfo.acis[i];
 
@@ -319,11 +297,24 @@ const mapStateToActiveCallProp = (
         peekedParticipants.push(peekedConversation);
       }
 
+      for (let i = 0; i < peekInfo.pendingAcis.length; i += 1) {
+        const aci = peekInfo.pendingAcis[i];
+
+        // In call links, pending users may be unknown until they share profile keys.
+        // conversationSelectorByAci should create conversations for new contacts.
+        const pendingConversation = conversationSelectorByAci(aci);
+        if (!pendingConversation) {
+          log.error('Pending participant has no corresponding conversation');
+          continue;
+        }
+
+        pendingParticipants.push(pendingConversation);
+      }
+
       return {
         ...baseResult,
         callMode: call.callMode,
         connectionState: call.connectionState,
-        conversationsWithSafetyNumberChanges,
         conversationsByDemuxId,
         deviceCount: peekInfo.deviceCount,
         groupMembers,
@@ -332,6 +323,7 @@ const mapStateToActiveCallProp = (
         localDemuxId,
         maxDevices: peekInfo.maxDevices,
         peekedParticipants,
+        pendingParticipants,
         raisedHands,
         remoteParticipants,
         remoteAudioLevels: call.remoteAudioLevels || new Map<number, number>(),
@@ -422,11 +414,9 @@ const mapStateToIncomingCallProp = (
 
 export const SmartCallManager = memo(function SmartCallManager() {
   const i18n = useSelector(getIntl);
-  const theme = useSelector(getTheme);
   const activeCall = useSelector(mapStateToActiveCallProp);
   const callLink = useSelector(mapStateToCallLinkProp);
   const incomingCall = useSelector(mapStateToIncomingCallProp);
-  const getPreferredBadge = useSelector(getPreferredBadgeSelector);
   const availableCameras = useSelector(getAvailableCameras);
   const hasInitialLoadCompleted = useSelector(getHasInitialLoadCompleted);
   const me = useSelector(getMe);
@@ -435,16 +425,20 @@ export const SmartCallManager = memo(function SmartCallManager() {
     : false;
 
   const {
+    approveUser,
+    batchUserAction,
+    denyUser,
     changeCallView,
     closeNeedPermissionScreen,
     getPresentingSources,
     cancelCall,
-    keyChangeOk,
     startCall,
     toggleParticipants,
     acceptCall,
     declineCall,
     openSystemPreferencesAction,
+    removeClient,
+    blockClient,
     sendGroupCallRaiseHand,
     sendGroupCallReaction,
     setGroupCallVideoRequest,
@@ -462,14 +456,18 @@ export const SmartCallManager = memo(function SmartCallManager() {
     toggleScreenRecordingPermissionsDialog,
     toggleSettings,
   } = useCallingActions();
-  const { showToast } = useToastActions();
   const { pauseVoiceNotePlayer } = useAudioPlayerActions();
+  const { showContactModal, showShareCallLinkViaSignal } =
+    useGlobalModalActions();
 
   return (
     <CallManager
       acceptCall={acceptCall}
       activeCall={activeCall}
+      approveUser={approveUser}
       availableCameras={availableCameras}
+      batchUserAction={batchUserAction}
+      blockClient={blockClient}
       bounceAppIconStart={bounceAppIconStart}
       bounceAppIconStop={bounceAppIconStop}
       callLink={callLink}
@@ -477,8 +475,11 @@ export const SmartCallManager = memo(function SmartCallManager() {
       changeCallView={changeCallView}
       closeNeedPermissionScreen={closeNeedPermissionScreen}
       declineCall={declineCall}
+      denyUser={denyUser}
       getGroupCallVideoFrameSource={getGroupCallVideoFrameSource}
-      getPreferredBadge={getPreferredBadge}
+      getIsSharingPhoneNumberWithEverybody={
+        getIsSharingPhoneNumberWithEverybody
+      }
       getPresentingSources={getPresentingSources}
       hangUpActiveCall={hangUpActiveCall}
       hasInitialLoadCompleted={hasInitialLoadCompleted}
@@ -486,17 +487,15 @@ export const SmartCallManager = memo(function SmartCallManager() {
       incomingCall={incomingCall}
       isConversationTooBigToRing={isConversationTooBigToRing}
       isGroupCallRaiseHandEnabled={isGroupCallRaiseHandEnabled()}
-      isGroupCallReactionsEnabled={isGroupCallReactionsEnabled()}
-      keyChangeOk={keyChangeOk}
       me={me}
       notifyForCall={notifyForCall}
       openSystemPreferencesAction={openSystemPreferencesAction}
       pauseVoiceNotePlayer={pauseVoiceNotePlayer}
       playRingtone={playRingtone}
+      removeClient={removeClient}
       renderDeviceSelection={renderDeviceSelection}
       renderEmojiPicker={renderEmojiPicker}
       renderReactionPicker={renderReactionPicker}
-      renderSafetyNumberViewer={renderSafetyNumberViewer}
       sendGroupCallRaiseHand={sendGroupCallRaiseHand}
       sendGroupCallReaction={sendGroupCallReaction}
       setGroupCallVideoRequest={setGroupCallVideoRequest}
@@ -507,12 +506,12 @@ export const SmartCallManager = memo(function SmartCallManager() {
       setOutgoingRing={setOutgoingRing}
       setPresenting={setPresenting}
       setRendererCanvas={setRendererCanvas}
-      showToast={showToast}
+      showContactModal={showContactModal}
+      showShareCallLinkViaSignal={showShareCallLinkViaSignal}
       startCall={startCall}
       stopRingtone={stopRingtone}
       switchFromPresentationView={switchFromPresentationView}
       switchToPresentationView={switchToPresentationView}
-      theme={theme}
       toggleParticipants={toggleParticipants}
       togglePip={togglePip}
       toggleScreenRecordingPermissionsDialog={

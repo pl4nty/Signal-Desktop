@@ -26,6 +26,7 @@ import { SignalService as Proto } from '../protobuf';
 import * as log from '../logging/log';
 import type { StickersStateType } from '../state/ducks/stickers';
 import { MINUTE } from '../util/durations';
+import { drop } from '../util/drop';
 
 export type StickerType = {
   packId: string;
@@ -56,6 +57,9 @@ export type DownloadMap = Record<
     status?: StickerPackStatusType;
   }
 >;
+
+export const STICKERPACK_ID_BYTE_LEN = 16;
+export const STICKERPACK_KEY_BYTE_LEN = 32;
 
 const BLESSED_PACKS: Record<string, BlessedType> = {
   '9acc9e8aba563d26a4994e69263e3b25': {
@@ -173,6 +177,7 @@ export function getInstalledStickerPacks(): Array<StickerPackType> {
 }
 
 export function downloadQueuedPacks(): void {
+  log.info('downloadQueuedPacks');
   strictAssert(packsToDownload, 'Stickers not initialized');
 
   const ids = Object.keys(packsToDownload);
@@ -180,10 +185,12 @@ export function downloadQueuedPacks(): void {
     const { key, status } = packsToDownload[id];
 
     // The queuing is done inside this function, no need to await here
-    void downloadStickerPack(id, key, {
-      finalStatus: status,
-      suppressError: true,
-    });
+    drop(
+      downloadStickerPack(id, key, {
+        finalStatus: status,
+        suppressError: true,
+      })
+    );
   }
 
   packsToDownload = {};
@@ -545,6 +552,7 @@ export type DownloadStickerPackOptions = Readonly<{
   messageId?: string;
   fromSync?: boolean;
   fromStorageService?: boolean;
+  fromBackup?: boolean;
   finalStatus?: StickerPackStatusType;
   suppressError?: boolean;
 }>;
@@ -575,6 +583,7 @@ async function doDownloadStickerPack(
     messageId,
     fromSync = false,
     fromStorageService = false,
+    fromBackup = false,
     suppressError = false,
   }: DownloadStickerPackOptions
 ): Promise<void> {
@@ -696,7 +705,7 @@ async function doDownloadStickerPack(
       status: 'pending',
       createdAt: Date.now(),
       stickers: {},
-      storageNeedsSync: !fromStorageService,
+      storageNeedsSync: !fromStorageService && !fromBackup,
       title: proto.title ?? '',
       author: proto.author ?? '',
     };
@@ -781,6 +790,7 @@ async function doDownloadStickerPack(
       await installStickerPack(packId, packKey, {
         fromSync,
         fromStorageService,
+        fromBackup,
       });
     } else {
       // Mark the pack as complete

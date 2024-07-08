@@ -80,6 +80,8 @@ import { updateDefaultSession } from './updateDefaultSession';
 import { PreventDisplaySleepService } from './PreventDisplaySleepService';
 import { SystemTrayService, focusAndForceToTop } from './SystemTrayService';
 import { SystemTraySettingCache } from './SystemTraySettingCache';
+import { OptionalResourceService } from './OptionalResourceService';
+import { EmojiService } from './EmojiService';
 import {
   SystemTraySetting,
   shouldMinimizeToSystemTray,
@@ -113,13 +115,12 @@ import { load as loadLocale } from './locale';
 
 import type { LoggerType } from '../ts/types/Logging';
 import { HourCyclePreference } from '../ts/types/I18N';
+import { ScreenShareStatus } from '../ts/types/Calling';
 import { DBVersionFromFutureError } from '../ts/sql/migrations';
 import type { ParsedSignalRoute } from '../ts/util/signalRoutes';
 import { parseSignalRoute } from '../ts/util/signalRoutes';
 import * as dns from '../ts/util/dns';
 import { ZoomFactorService } from '../ts/services/ZoomFactorService';
-
-const STICKER_CREATOR_PARTITION = 'sticker-creator';
 
 const animationSettings = systemPreferences.getAnimationSettings();
 
@@ -207,6 +208,7 @@ const defaultWebPrefs = {
 const DISABLE_GPU =
   OS.isLinux() && !process.argv.some(arg => arg === '--enable-gpu');
 
+const DISABLE_IPV6 = process.argv.some(arg => arg === '--disable-ipv6');
 const FORCE_ENABLE_CRASH_REPORTS = process.argv.some(
   arg => arg === '--enable-crash-reports'
 );
@@ -998,21 +1000,24 @@ ipc.handle('database-ready', async () => {
   getLogger().info('sending `database-ready`');
 });
 
-ipc.handle('get-art-creator-auth', () => {
-  const { promise, resolve } = explodePromise<unknown>();
-  strictAssert(mainWindow, 'Main window did not exist');
+ipc.handle(
+  'art-creator:uploadStickerPack',
+  (_event: Electron.Event, data: unknown) => {
+    const { promise, resolve } = explodePromise<unknown>();
+    strictAssert(mainWindow, 'Main window did not exist');
 
-  mainWindow.webContents.send('open-art-creator');
+    mainWindow.webContents.send('art-creator:uploadStickerPack', data);
 
-  ipc.handleOnce('open-art-creator', (_event, { username, password }) => {
-    resolve({
-      baseUrl: config.get<string>('artCreatorUrl'),
-      username,
-      password,
+    ipc.once('art-creator:uploadStickerPack:done', (_doneEvent, response) => {
+      resolve(response);
     });
-  });
 
-  return promise;
+    return promise;
+  }
+);
+
+ipc.on('art-creator:onUploadProgress', () => {
+  stickerCreatorWindow?.webContents.send('art-creator:onUploadProgress');
 });
 
 ipc.on('show-window', () => {
@@ -1232,6 +1237,67 @@ async function showScreenShareWindow(sourceName: string) {
     screenShareWindow,
     await prepareFileUrl([__dirname, '../screenShare.html'], { sourceName })
   );
+}
+
+let callingDevToolsWindow: BrowserWindow | undefined;
+async function showCallingDevToolsWindow() {
+  if (callingDevToolsWindow) {
+    callingDevToolsWindow.show();
+    return;
+  }
+
+  const options = {
+    height: 1200,
+    width: 1000,
+    alwaysOnTop: false,
+    autoHideMenuBar: true,
+    backgroundColor: '#ffffff',
+    darkTheme: false,
+    frame: true,
+    fullscreenable: true,
+    maximizable: true,
+    minimizable: true,
+    resizable: true,
+    show: false,
+    title: getResolvedMessagesLocale().i18n('icu:callingDeveloperTools'),
+    titleBarStyle: nonMainTitleBarStyle,
+    webPreferences: {
+      ...defaultWebPrefs,
+      nodeIntegration: false,
+      nodeIntegrationInWorker: false,
+      sandbox: true,
+      contextIsolation: true,
+      nativeWindowOpen: true,
+      preload: join(__dirname, '../bundles/calling-tools/preload.js'),
+    },
+  };
+
+  callingDevToolsWindow = new BrowserWindow(options);
+
+  await handleCommonWindowEvents(callingDevToolsWindow);
+
+  callingDevToolsWindow.once('closed', () => {
+    callingDevToolsWindow = undefined;
+
+    mainWindow?.webContents.send('calling:set-rtc-stats-interval', null);
+  });
+
+  ipc.on('calling:set-rtc-stats-interval', (_, intervalMillis: number) => {
+    mainWindow?.webContents.send(
+      'calling:set-rtc-stats-interval',
+      intervalMillis
+    );
+  });
+
+  ipc.on('calling:rtc-stats-report', (_, report) => {
+    callingDevToolsWindow?.webContents.send('calling:rtc-stats-report', report);
+  });
+
+  await safeLoadURL(
+    callingDevToolsWindow,
+    await prepareFileUrl([__dirname, '../calling_tools.html'])
+  );
+  callingDevToolsWindow.show();
 }
 
 let aboutWindow: BrowserWindow | undefined;
@@ -1748,6 +1814,9 @@ if (DISABLE_GPU) {
 let ready = false;
 app.on('ready', async () => {
   dns.setFallback(await getDNSFallback());
+  if (DISABLE_IPV6) {
+    dns.setIPv6Enabled(false);
+  }
 
   const [userDataPath, crashDumpsPath, installPath] = await Promise.all([
     realpath(app.getPath('userData')),
@@ -1755,19 +1824,15 @@ app.on('ready', async () => {
     realpath(app.getAppPath()),
   ]);
 
-  const webSession = session.fromPartition(STICKER_CREATOR_PARTITION);
+  updateDefaultSession(session.defaultSession);
 
-  for (const s of [session.defaultSession, webSession]) {
-    updateDefaultSession(s);
-
-    if (getEnvironment() !== Environment.Test) {
-      installFileHandler({
-        session: s,
-        userDataPath,
-        installPath,
-        isWindows: OS.isWindows(),
-      });
-    }
+  if (getEnvironment() !== Environment.Test) {
+    installFileHandler({
+      session: session.defaultSession,
+      userDataPath,
+      installPath,
+      isWindows: OS.isWindows(),
+    });
   }
 
   installWebHandler({
@@ -1775,15 +1840,15 @@ app.on('ready', async () => {
     session: session.defaultSession,
   });
 
-  installWebHandler({
-    enableHttp: true,
-    session: webSession,
-  });
-
   logger = await logging.initialize(getMainWindow);
 
   // Write buffered information into newly created logger.
   consoleLogger.writeBufferInto(logger);
+
+  const resourceService = OptionalResourceService.create(
+    join(userDataPath, 'optionalResources')
+  );
+  await EmojiService.create(resourceService);
 
   sqlInitPromise = initializeSQL(userDataPath);
 
@@ -2080,6 +2145,7 @@ function setupMenu(options?: Partial<CreateTemplateOptionsType>) {
     setupAsStandalone,
     showAbout,
     showDebugLog: showDebugLogWindow,
+    showCallingDevTools: showCallingDevToolsWindow,
     showKeyboardShortcuts,
     showSettings: showSettingsWindow,
     showWindow,
@@ -2351,11 +2417,20 @@ ipc.on(
   }
 );
 
-ipc.on('close-screen-share-controller', () => {
-  if (screenShareWindow) {
-    screenShareWindow.close();
+ipc.on(
+  'screen-share:status-change',
+  (_event: Electron.Event, status: ScreenShareStatus) => {
+    if (!screenShareWindow) {
+      return;
+    }
+
+    if (status === ScreenShareStatus.Disconnected) {
+      screenShareWindow.close();
+    } else {
+      screenShareWindow.webContents.send('status-change', status);
+    }
   }
-});
+);
 
 ipc.on('stop-screen-share', () => {
   if (mainWindow) {
@@ -2460,7 +2535,6 @@ ipc.on('get-config', async event => {
     storageUrl: config.get<string>('storageUrl'),
     updatesUrl: config.get<string>('updatesUrl'),
     resourcesUrl: config.get<string>('resourcesUrl'),
-    artCreatorUrl: config.get<string>('artCreatorUrl'),
     cdnUrl0: config.get<string>('cdn.0'),
     cdnUrl2: config.get<string>('cdn.2'),
     cdnUrl3: config.get<string>('cdn.3'),
@@ -2469,9 +2543,11 @@ ipc.on('get-config', async event => {
       !isTestEnvironment(getEnvironment()) && ciMode
         ? Environment.Production
         : getEnvironment(),
+    isMockTestEnvironment: Boolean(process.env.MOCK_TEST),
     ciMode,
     // Should be already computed and cached at this point
     dnsFallback: await getDNSFallback(),
+    disableIPv6: DISABLE_IPV6,
     ciBackupPath: config.get<string | null>('ciBackupPath') || undefined,
     nodeVersion: process.versions.node,
     hostname: os.hostname(),
@@ -2486,6 +2562,7 @@ ipc.on('get-config', async event => {
     serverPublicParams: config.get<string>('serverPublicParams'),
     serverTrustRoot: config.get<string>('serverTrustRoot'),
     genericServerPublicParams: config.get<string>('genericServerPublicParams'),
+    backupServerPublicParams: config.get<string>('backupServerPublicParams'),
     theme,
     appStartInitialSpellcheckSetting,
 
@@ -2607,11 +2684,6 @@ function handleSignalRoute(route: ParsedSignalRoute) {
     mainWindow.webContents.send('show-sticker-pack', {
       packId: route.args.packId,
       packKey: Buffer.from(route.args.packKey, 'hex').toString('base64'),
-    });
-  } else if (route.key === 'artAuth') {
-    mainWindow.webContents.send('authorize-art-creator', {
-      token: route.args.token,
-      pubKeyBase64: route.args.pubKey,
     });
   } else if (route.key === 'groupInvites') {
     mainWindow.webContents.send('show-group-via-link', {
@@ -2898,7 +2970,6 @@ async function showStickerCreatorWindow() {
     show: false,
     webPreferences: {
       ...defaultWebPrefs,
-      partition: STICKER_CREATOR_PARTITION,
       nodeIntegration: false,
       nodeIntegrationInWorker: false,
       sandbox: true,
@@ -2927,18 +2998,27 @@ async function showStickerCreatorWindow() {
 }
 
 if (isTestEnvironment(getEnvironment())) {
+  ipc.on('ci:test-electron:getArgv', event => {
+    // eslint-disable-next-line no-param-reassign
+    event.returnValue = process.argv;
+  });
+
   ipc.handle('ci:test-electron:debug', async (_event, info) => {
     process.stdout.write(`ci:test-electron:debug=${JSON.stringify(info)}\n`);
   });
 
-  ipc.handle('ci:test-electron:done', async (_event, info) => {
-    if (!process.env.TEST_QUIT_ON_COMPLETE) {
-      return;
-    }
-
+  ipc.handle('ci:test-electron:event', async (_event, event) => {
     process.stdout.write(
-      `ci:test-electron:done=${JSON.stringify(info)}\n`,
-      () => app.quit()
+      `ci:test-electron:event=${JSON.stringify(event)}\n`,
+      () => {
+        if (event.type !== 'end') {
+          return;
+        }
+        if (!process.env.TEST_QUIT_ON_COMPLETE) {
+          return;
+        }
+        app.quit();
+      }
     );
   });
 }

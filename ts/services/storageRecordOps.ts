@@ -202,6 +202,18 @@ export async function toContactRecord(
   if (profileFamilyName) {
     contactRecord.familyName = profileFamilyName;
   }
+  const nicknameGivenName = conversation.get('nicknameGivenName');
+  const nicknameFamilyName = conversation.get('nicknameFamilyName');
+  if (nicknameGivenName || nicknameFamilyName) {
+    contactRecord.nickname = {
+      given: nicknameGivenName,
+      family: nicknameFamilyName,
+    };
+  }
+  const note = conversation.get('note');
+  if (note) {
+    contactRecord.note = note;
+  }
   const systemGivenName = conversation.get('systemGivenName');
   if (systemGivenName) {
     contactRecord.systemGivenName = systemGivenName;
@@ -376,12 +388,38 @@ export function toAccountRecord(
   accountRecord.pinnedConversations = pinnedConversations;
 
   const subscriberId = window.storage.get('subscriberId');
-  if (subscriberId instanceof Uint8Array) {
+  if (Bytes.isNotEmpty(subscriberId)) {
     accountRecord.subscriberId = subscriberId;
   }
-  const subscriberCurrencyCode = window.storage.get('subscriberCurrencyCode');
+  const subscriberCurrencyCode = window.storage.get(
+    'backupsSubscriberCurrencyCode'
+  );
   if (typeof subscriberCurrencyCode === 'string') {
     accountRecord.subscriberCurrencyCode = subscriberCurrencyCode;
+  }
+  const donorSubscriptionManuallyCancelled = window.storage.get(
+    'donorSubscriptionManuallyCancelled'
+  );
+  if (typeof donorSubscriptionManuallyCancelled === 'boolean') {
+    accountRecord.donorSubscriptionManuallyCancelled =
+      donorSubscriptionManuallyCancelled;
+  }
+  const backupsSubscriberId = window.storage.get('backupsSubscriberId');
+  if (Bytes.isNotEmpty(backupsSubscriberId)) {
+    accountRecord.backupsSubscriberId = backupsSubscriberId;
+  }
+  const backupsSubscriberCurrencyCode = window.storage.get(
+    'backupsSubscriberCurrencyCode'
+  );
+  if (typeof backupsSubscriberCurrencyCode === 'string') {
+    accountRecord.backupsSubscriberCurrencyCode = backupsSubscriberCurrencyCode;
+  }
+  const backupsSubscriptionManuallyCancelled = window.storage.get(
+    'backupsSubscriptionManuallyCancelled'
+  );
+  if (typeof backupsSubscriptionManuallyCancelled === 'boolean') {
+    accountRecord.backupsSubscriptionManuallyCancelled =
+      backupsSubscriptionManuallyCancelled;
   }
   const displayBadgesOnProfile = window.storage.get('displayBadgesOnProfile');
   if (displayBadgesOnProfile !== undefined) {
@@ -410,6 +448,14 @@ export function toAccountRecord(
   if (hasCompletedUsernameOnboarding !== undefined) {
     accountRecord.hasCompletedUsernameOnboarding =
       hasCompletedUsernameOnboarding;
+  }
+
+  const hasSeenGroupStoryEducationSheet = window.storage.get(
+    'hasSeenGroupStoryEducationSheet'
+  );
+  if (hasSeenGroupStoryEducationSheet !== undefined) {
+    accountRecord.hasSeenGroupStoryEducationSheet =
+      hasSeenGroupStoryEducationSheet;
   }
 
   const hasStoriesDisabled = window.storage.get('hasStoriesDisabled');
@@ -1064,7 +1110,11 @@ export async function mergeContactRecord(
   ) {
     // Local name doesn't match remote name, fetch profile
     if (localName) {
-      void conversation.getProfiles();
+      drop(
+        conversation.getProfiles().catch(() => {
+          /* nothing to do here; logging already happened */
+        })
+      );
       details.push('refreshing profile');
     } else {
       conversation.set({
@@ -1078,6 +1128,9 @@ export async function mergeContactRecord(
     systemGivenName: dropNull(contactRecord.systemGivenName),
     systemFamilyName: dropNull(contactRecord.systemFamilyName),
     systemNickname: dropNull(contactRecord.systemNickname),
+    nicknameGivenName: dropNull(contactRecord.nickname?.given),
+    nicknameFamilyName: dropNull(contactRecord.nickname?.family),
+    note: dropNull(contactRecord.note),
   });
 
   // https://github.com/signalapp/Signal-Android/blob/fc3db538bcaa38dc149712a483d3032c9c1f3998/app/src/main/java/org/thoughtcrime/securesms/database/RecipientDatabase.kt#L921-L936
@@ -1204,9 +1257,14 @@ export async function mergeAccountRecord(
     preferredReactionEmoji: rawPreferredReactionEmoji,
     subscriberId,
     subscriberCurrencyCode,
+    donorSubscriptionManuallyCancelled,
+    backupsSubscriberId,
+    backupsSubscriberCurrencyCode,
+    backupsSubscriptionManuallyCancelled,
     displayBadgesOnProfile,
     keepMutedChatsArchived,
     hasCompletedUsernameOnboarding,
+    hasSeenGroupStoryEducationSheet,
     hasSetMyStoriesPrivacy,
     hasViewedOnboardingStory,
     storiesDisabled,
@@ -1409,11 +1467,32 @@ export async function mergeAccountRecord(
     );
   }
 
-  if (subscriberId instanceof Uint8Array) {
+  if (Bytes.isNotEmpty(subscriberId)) {
     await window.storage.put('subscriberId', subscriberId);
   }
   if (typeof subscriberCurrencyCode === 'string') {
     await window.storage.put('subscriberCurrencyCode', subscriberCurrencyCode);
+  }
+  if (donorSubscriptionManuallyCancelled != null) {
+    await window.storage.put(
+      'donorSubscriptionManuallyCancelled',
+      donorSubscriptionManuallyCancelled
+    );
+  }
+  if (Bytes.isNotEmpty(backupsSubscriberId)) {
+    await window.storage.put('backupsSubscriberId', backupsSubscriberId);
+  }
+  if (typeof backupsSubscriberCurrencyCode === 'string') {
+    await window.storage.put(
+      'backupsSubscriberCurrencyCode',
+      backupsSubscriberCurrencyCode
+    );
+  }
+  if (backupsSubscriptionManuallyCancelled != null) {
+    await window.storage.put(
+      'backupsSubscriptionManuallyCancelled',
+      backupsSubscriptionManuallyCancelled
+    );
   }
   await window.storage.put(
     'displayBadgesOnProfile',
@@ -1445,6 +1524,15 @@ export async function mergeAccountRecord(
     );
     await window.storage.put(
       'hasCompletedUsernameOnboarding',
+      hasCompletedUsernameOnboardingBool
+    );
+  }
+  {
+    const hasCompletedUsernameOnboardingBool = Boolean(
+      hasSeenGroupStoryEducationSheet
+    );
+    await window.storage.put(
+      'hasSeenGroupStoryEducationSheet',
       hasCompletedUsernameOnboardingBool
     );
   }

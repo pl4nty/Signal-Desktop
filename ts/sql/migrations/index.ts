@@ -75,10 +75,19 @@ import { updateToSchemaVersion960 } from './960-untag-pni';
 import { updateToSchemaVersion970 } from './970-fts5-optimize';
 import { updateToSchemaVersion980 } from './980-reaction-timestamp';
 import { updateToSchemaVersion990 } from './990-phone-number-sharing';
+import { updateToSchemaVersion1000 } from './1000-mark-unread-call-history-messages-as-unseen';
+import { updateToSchemaVersion1010 } from './1010-call-links-table';
+import { updateToSchemaVersion1020 } from './1020-self-merges';
+import { updateToSchemaVersion1030 } from './1030-unblock-event';
+import { updateToSchemaVersion1040 } from './1040-undownloaded-backed-up-media';
+import { updateToSchemaVersion1050 } from './1050-group-send-endorsements';
+import { updateToSchemaVersion1060 } from './1060-addressable-messages-and-sync-tasks';
+import { updateToSchemaVersion1070 } from './1070-attachment-backup';
+import { updateToSchemaVersion1080 } from './1080-nondisappearing-addressable';
 import {
+  updateToSchemaVersion1090,
   version as MAX_VERSION,
-  updateToSchemaVersion1000,
-} from './1000-mark-unread-call-history-messages-as-unseen';
+} from './1090-message-delete-indexes';
 
 function updateToSchemaVersion1(
   currentVersion: number,
@@ -2020,7 +2029,17 @@ export const SCHEMA_VERSIONS = [
   updateToSchemaVersion970,
   updateToSchemaVersion980,
   updateToSchemaVersion990,
+
   updateToSchemaVersion1000,
+  updateToSchemaVersion1010,
+  updateToSchemaVersion1020,
+  updateToSchemaVersion1030,
+  updateToSchemaVersion1040,
+  updateToSchemaVersion1050,
+  updateToSchemaVersion1060,
+  updateToSchemaVersion1070,
+  updateToSchemaVersion1080,
+  updateToSchemaVersion1090,
 ];
 
 export class DBVersionFromFutureError extends Error {

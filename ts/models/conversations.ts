@@ -51,7 +51,7 @@ import type {
   CustomColorType,
 } from '../types/Colors';
 import type { MessageModel } from './messages';
-import { getContact } from '../messages/helpers';
+import { getAuthor } from '../messages/helpers';
 import { strictAssert } from '../util/assert';
 import { isConversationMuted } from '../util/isConversationMuted';
 import { isConversationSMSOnly } from '../util/isConversationSMSOnly';
@@ -165,6 +165,13 @@ import OS from '../util/os/osMain';
 import { getMessageAuthorText } from '../util/getMessageAuthorText';
 import { downscaleOutgoingAttachment } from '../util/attachments';
 import { MessageRequestResponseEvent } from '../types/MessageRequestResponseEvent';
+import type { MessageToDelete } from '../textsecure/messageReceiverEvents';
+import {
+  getConversationToDelete,
+  getMessageToDelete,
+} from '../util/deleteForMe';
+import { isEnabled } from '../RemoteConfig';
+import { getCallHistorySelector } from '../state/selectors/callHistory';
 
 /* eslint-disable more/no-then */
 window.Whisper = window.Whisper || {};
@@ -185,6 +192,8 @@ const {
   getOlderMessagesByConversation,
   getMessageMetricsForConversation,
   getMessageById,
+  getMostRecentAddressableMessages,
+  getMostRecentAddressableNondisappearingMessages,
   getNewerMessagesByConversation,
 } = window.Signal.Data;
 
@@ -2122,17 +2131,26 @@ export class ConversationModel extends window.Backbone
   async addMessageRequestResponseEventMessage(
     event: MessageRequestResponseEvent
   ): Promise<void> {
-    const now = Date.now();
+    const timestamp = Date.now();
+    const lastMessageTimestamp =
+      // Fallback to `timestamp` since `lastMessageReceivedAtMs` is new
+      this.get('lastMessageReceivedAtMs') ?? this.get('timestamp') ?? timestamp;
+
+    const maybeLastMessageTimestamp =
+      event === MessageRequestResponseEvent.ACCEPT
+        ? timestamp
+        : lastMessageTimestamp;
+
     const message: MessageAttributesType = {
       id: generateGuid(),
       conversationId: this.id,
       type: 'message-request-response-event',
-      sent_at: now,
+      sent_at: maybeLastMessageTimestamp,
       received_at: incrementMessageCounter(),
-      received_at_ms: now,
+      received_at_ms: maybeLastMessageTimestamp,
       readStatus: ReadStatus.Read,
       seenStatus: SeenStatus.NotApplicable,
-      timestamp: now,
+      timestamp,
       messageRequestResponseEvent: event,
     };
 
@@ -2161,6 +2179,9 @@ export class ConversationModel extends window.Backbone
       const didResponseChange = response !== currentMessageRequestState;
       const wasPreviouslyAccepted = this.getAccepted();
 
+      const didUnblock =
+        response === messageRequestEnum.ACCEPT && this.isBlocked();
+
       if (didResponseChange) {
         if (response === messageRequestEnum.ACCEPT) {
           // Only add a message when the user took an explicit action to accept
@@ -2168,7 +2189,9 @@ export class ConversationModel extends window.Backbone
           if (!viaStorageServiceSync) {
             drop(
               this.addMessageRequestResponseEventMessage(
-                MessageRequestResponseEvent.ACCEPT
+                didUnblock
+                  ? MessageRequestResponseEvent.UNBLOCK
+                  : MessageRequestResponseEvent.ACCEPT
               )
             );
           }
@@ -2219,7 +2242,7 @@ export class ConversationModel extends window.Backbone
         }
 
         if (isDelete) {
-          await this.destroyMessages();
+          await this.destroyMessages({ source: 'message-request' });
           void this.updateLastMessage();
         }
 
@@ -2713,11 +2736,17 @@ export class ConversationModel extends window.Backbone
       return this.get('verified') === this.verifiedEnum.VERIFIED;
     }
 
-    if (!this.contactCollection?.length) {
+    const contacts = this.contactCollection;
+
+    if (contacts == null || contacts.length === 0) {
       return false;
     }
 
-    return this.contactCollection?.every(contact => {
+    if (contacts.length === 1 && isMe(contacts.first()?.attributes)) {
+      return false;
+    }
+
+    return contacts.every(contact => {
       if (isMe(contact.attributes)) {
         return true;
       }
@@ -2917,6 +2946,13 @@ export class ConversationModel extends window.Backbone
       senderAci,
     });
 
+    if (!this.get('active_at')) {
+      log.warn(
+        `addDeliveryIssue: ${this.idForLogging()} has no active_at, dropping delivery issue instead of adding`
+      );
+      return;
+    }
+
     const message = {
       conversationId: this.id,
       type: 'delivery-issue',
@@ -2994,15 +3030,9 @@ export class ConversationModel extends window.Backbone
         'addKeyChange'
       );
 
-      const isUntrusted = await this.isUntrusted();
-
       this.trigger('newmessage', model);
 
       const serviceId = this.getServiceId();
-      // Group calls are always with folks that have a serviceId
-      if (isUntrusted && isAciString(serviceId)) {
-        window.reduxActions.calling.keyChanged({ aci: serviceId });
-      }
 
       if (isDirectConversation(this.attributes)) {
         window.reduxActions?.safetyNumber.clearSafetyNumber(this.id);
@@ -3341,13 +3371,19 @@ export class ConversationModel extends window.Backbone
 
     const message = window.MessageCache.__DEPRECATED$getById(notificationId);
     if (message) {
-      await window.Signal.Data.removeMessage(message.id);
+      await window.Signal.Data.removeMessage(message.id, {
+        singleProtoJobQueue,
+      });
     }
     return true;
   }
 
   async maybeSetContactRemoved(): Promise<void> {
     if (!isDirectConversation(this.attributes)) {
+      return;
+    }
+
+    if (this.attributes.removalStage !== 'justNotification') {
       return;
     }
 
@@ -3378,7 +3414,9 @@ export class ConversationModel extends window.Backbone
 
     const message = window.MessageCache.__DEPRECATED$getById(notificationId);
     if (message) {
-      await window.Signal.Data.removeMessage(message.id);
+      await window.Signal.Data.removeMessage(message.id, {
+        singleProtoJobQueue,
+      });
     }
 
     return true;
@@ -3934,27 +3972,6 @@ export class ConversationModel extends window.Backbone
       model,
       'enqueueMessageForSend'
     );
-    message.cachedOutgoingContactData = contact;
-
-    // Attach path to preview images so that sendNormalMessage can use them to
-    // update digests on attachments.
-    if (preview) {
-      message.cachedOutgoingPreviewData = preview.map((item, index) => {
-        if (!item.image) {
-          return item;
-        }
-
-        return {
-          ...item,
-          image: {
-            ...item.image,
-            path: attributes.preview?.at(index)?.image?.path,
-          },
-        };
-      });
-    }
-    message.cachedOutgoingQuoteData = quote;
-    message.cachedOutgoingStickerData = sticker;
 
     const dbStart = Date.now();
 
@@ -4139,6 +4156,11 @@ export class ConversationModel extends window.Backbone
         this.maybeSetPendingUniversalTimer(stats.hasUserInitiatedMessages)
       )
     );
+    drop(
+      this.queueJob('maybeAddRemovedNotificaiton', async () =>
+        this.maybeSetContactRemoved()
+      )
+    );
 
     const { preview, activity } = stats;
     let previewMessage: MessageModel | undefined;
@@ -4173,16 +4195,25 @@ export class ConversationModel extends window.Backbone
       return;
     }
 
-    const currentTimestamp = this.get('timestamp') || null;
-
-    let timestamp = currentTimestamp;
+    let timestamp = this.get('timestamp') || null;
+    let lastMessageReceivedAt = this.get('lastMessageReceivedAt');
+    let lastMessageReceivedAtMs = this.get('lastMessageReceivedAtMs');
     if (activityMessage) {
-      const receivedAt = activityMessage.get('received_at_ms');
-      timestamp = receivedAt
-        ? Math.min(activityMessage.get('sent_at'), receivedAt)
-        : activityMessage.get('sent_at');
+      const callId = activityMessage.get('callId');
+      const callHistory = callId
+        ? getCallHistorySelector(window.reduxStore.getState())(callId)
+        : undefined;
+
+      timestamp =
+        callHistory?.timestamp ||
+        activityMessage.get('editMessageTimestamp') ||
+        activityMessage.get('sent_at') ||
+        timestamp;
+      lastMessageReceivedAt =
+        activityMessage.get('received_at') || lastMessageReceivedAt;
+      lastMessageReceivedAtMs =
+        activityMessage.get('received_at_ms') || lastMessageReceivedAtMs;
     }
-    timestamp = timestamp || currentTimestamp;
 
     const notificationData = previewMessage?.getNotificationData();
 
@@ -4196,6 +4227,8 @@ export class ConversationModel extends window.Backbone
         (previewMessage
           ? getMessagePropStatus(previewMessage.attributes, ourConversationId)
           : null) || null,
+      lastMessageReceivedAt,
+      lastMessageReceivedAtMs,
       timestamp,
       lastMessageDeletedForEveryone: previewMessage
         ? previewMessage.get('deletedForEveryone')
@@ -4420,7 +4453,6 @@ export class ConversationModel extends window.Backbone
       source: providedSource,
       fromSync = false,
       isInitialSync = false,
-      fromGroupUpdate = false,
     }: {
       reason: string;
       receivedAt?: number;
@@ -4429,7 +4461,6 @@ export class ConversationModel extends window.Backbone
       source?: string;
       fromSync?: boolean;
       isInitialSync?: boolean;
-      fromGroupUpdate?: boolean;
     }
   ): Promise<boolean | null | MessageModel | void> {
     const isSetByOther = providedSource || providedSentAt !== undefined;
@@ -4499,9 +4530,10 @@ export class ConversationModel extends window.Backbone
       }
     }
 
-    const ourConversationId =
-      window.ConversationController.getOurConversationId();
-    source = source || ourConversationId;
+    const ourConversation =
+      window.ConversationController.getOurConversationOrThrow();
+    source = source || ourConversation.id;
+    const sourceServiceId = ourConversation.get('serviceId');
 
     this.set({ expireTimer });
 
@@ -4518,20 +4550,20 @@ export class ConversationModel extends window.Backbone
     const isFromSyncOperation =
       reason === 'group sync' || reason === 'contact sync';
     const isFromMe =
-      window.ConversationController.get(source)?.id === ourConversationId;
+      window.ConversationController.get(source) === ourConversation;
     const isNoteToSelf = isMe(this.attributes);
     const shouldBeRead =
       (isInitialSync && isFromSyncOperation) || isFromMe || isNoteToSelf;
 
     const id = generateGuid();
-    const model = new window.Whisper.Message({
+    const attributes = {
       id,
       conversationId: this.id,
       expirationTimerUpdate: {
         expireTimer,
         source,
+        sourceServiceId,
         fromSync,
-        fromGroupUpdate,
       },
       flags: Proto.DataMessage.Flags.EXPIRATION_TIMER_UPDATE,
       readStatus: shouldBeRead ? ReadStatus.Read : ReadStatus.Unread,
@@ -4539,17 +4571,18 @@ export class ConversationModel extends window.Backbone
       received_at: receivedAt ?? incrementMessageCounter(),
       seenStatus: shouldBeRead ? SeenStatus.Seen : SeenStatus.Unseen,
       sent_at: sentAt,
-      type: 'timer-notification',
-      // TODO: DESKTOP-722
-    } as unknown as MessageAttributesType);
+      timestamp: sentAt,
+      type: 'timer-notification' as const,
+    };
 
-    await window.Signal.Data.saveMessage(model.attributes, {
+    await window.Signal.Data.saveMessage(attributes, {
       ourAci: window.textsecure.storage.user.getCheckedAci(),
+      forceSave: true,
     });
 
     const message = window.MessageCache.__DEPRECATED$register(
       id,
-      model,
+      new window.Whisper.Message(attributes),
       'updateExpirationTimer'
     );
 
@@ -4557,7 +4590,7 @@ export class ConversationModel extends window.Backbone
     void this.updateUnread();
 
     log.info(
-      `${logId}: added a notification received_at=${model.get('received_at')}`
+      `${logId}: added a notification received_at=${message.get('received_at')}`
     );
 
     return message;
@@ -4645,7 +4678,11 @@ export class ConversationModel extends window.Backbone
 
   onChangeProfileKey(): void {
     if (isDirectConversation(this.attributes)) {
-      void this.getProfiles();
+      drop(
+        this.getProfiles().catch(() => {
+          /* nothing to do here; logging already happened */
+        })
+      );
     }
   }
 
@@ -4942,7 +4979,30 @@ export class ConversationModel extends window.Backbone
     this.contactCollection!.reset(members);
   }
 
-  async destroyMessages(): Promise<void> {
+  async destroyMessages({
+    source,
+  }: {
+    source: 'message-request' | 'local-delete-sync' | 'local-delete';
+  }): Promise<void> {
+    const logId = `destroyMessages(${this.idForLogging()})/${source}`;
+
+    log.info(`${logId}: Queuing job on conversation`);
+
+    await this.queueJob(logId, async () => {
+      log.info(`${logId}: Starting...`);
+
+      await this.destroyMessagesInner({ logId, source });
+    });
+  }
+
+  async destroyMessagesInner({
+    logId: providedLogId,
+    source,
+  }: {
+    logId: string;
+    source: 'message-request' | 'local-delete-sync' | 'local-delete';
+  }): Promise<void> {
+    const logId = `${providedLogId}/destroyMessagesInner`;
     this.set({
       lastMessage: null,
       lastMessageAuthor: null,
@@ -4952,9 +5012,80 @@ export class ConversationModel extends window.Backbone
     });
     window.Signal.Data.updateConversation(this.attributes);
 
-    await window.Signal.Data.removeAllMessagesInConversation(this.id, {
+    const ourConversation =
+      window.ConversationController.getOurConversationOrThrow();
+    const capable = Boolean(ourConversation.get('capabilities')?.deleteSync);
+    if (
+      source === 'local-delete' &&
+      capable &&
+      isEnabled('desktop.deleteSync.send')
+    ) {
+      log.info(`${logId}: Preparing sync message`);
+      const timestamp = Date.now();
+
+      const addressableMessages = await getMostRecentAddressableMessages(
+        this.id
+      );
+      const mostRecentMessages: Array<MessageToDelete> = addressableMessages
+        .map(getMessageToDelete)
+        .filter(isNotNil)
+        .slice(0, 5);
+      log.info(
+        `${logId}: Found ${mostRecentMessages.length} most recent messages`
+      );
+
+      const areAnyDisappearing = addressableMessages.some(
+        item => item.expireTimer
+      );
+
+      let mostRecentNonExpiringMessages: Array<MessageToDelete> | undefined;
+      if (areAnyDisappearing) {
+        const nondisappearingAddressableMessages =
+          await getMostRecentAddressableNondisappearingMessages(this.id);
+        mostRecentNonExpiringMessages = nondisappearingAddressableMessages
+          .map(getMessageToDelete)
+          .filter(isNotNil)
+          .slice(0, 5);
+        log.info(
+          `${logId}: Found ${mostRecentNonExpiringMessages.length} most recent nondisappearing messages`
+        );
+      }
+
+      if (mostRecentMessages.length > 0) {
+        await singleProtoJobQueue.add(
+          MessageSender.getDeleteForMeSyncMessage([
+            {
+              type: 'delete-conversation',
+              conversation: getConversationToDelete(this.attributes),
+              isFullDelete: true,
+              mostRecentMessages,
+              mostRecentNonExpiringMessages,
+              timestamp,
+            },
+          ])
+        );
+      } else {
+        await singleProtoJobQueue.add(
+          MessageSender.getDeleteForMeSyncMessage([
+            {
+              type: 'delete-local-conversation',
+              conversation: getConversationToDelete(this.attributes),
+              timestamp,
+            },
+          ])
+        );
+      }
+
+      log.info(`${logId}: Sync message queue complete`);
+    }
+
+    log.info(`${logId}: Starting delete`);
+    await window.Signal.Data.removeMessagesInConversation(this.id, {
+      fromSync: source !== 'local-delete-sync',
       logId: this.idForLogging(),
+      singleProtoJobQueue,
     });
+    log.info(`${logId}: Delete complete`);
   }
 
   getTitle(options?: { isShort?: boolean }): string {
@@ -5019,6 +5150,7 @@ export class ConversationModel extends window.Backbone
   // [X] verified!
   // [-] profileName
   // [-] profileFamilyName
+  // [X] nicknameAndNote
   // [X] blocked
   // [X] whitelisted
   // [X] archived
@@ -5130,7 +5262,7 @@ export class ConversationModel extends window.Backbone
 
     const sender = reaction
       ? window.ConversationController.get(reaction.fromId)
-      : getContact(message.attributes);
+      : getAuthor(message.attributes);
     const senderName = sender
       ? sender.getTitle()
       : window.i18n('icu:unknownContact');

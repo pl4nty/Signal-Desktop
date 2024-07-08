@@ -51,6 +51,7 @@ const MESSAGE_DEFAULT_PROPS = {
   isMessageRequestAccepted: true,
   isSelected: false,
   isSelectMode: false,
+  isSMS: false,
   onToggleSelect: shouldNeverBeCalled,
   onReplyToMessage: shouldNeverBeCalled,
   kickOffAttachmentDownload: shouldNeverBeCalled,
@@ -236,6 +237,7 @@ export function StoryViewsNRepliesModal({
               getPreferredBadge={getPreferredBadge}
               i18n={i18n}
               inputApi={inputApiRef}
+              isActive
               isFormattingEnabled={isFormattingEnabled}
               moduleClassName="StoryViewsNRepliesModal__input"
               onCloseLinkPreview={noop}
@@ -440,18 +442,16 @@ export function StoryViewsNRepliesModal({
       <Modal
         modalName="StoryViewsNRepliesModal"
         i18n={i18n}
-        moduleClassName="StoryViewsNRepliesModal"
+        moduleClassName={classNames({
+          StoryViewsNRepliesModal: true,
+          'StoryViewsNRepliesModal--group': Boolean(group),
+        })}
         onClose={onClose}
         padded={false}
         useFocusTrap={Boolean(composerElement)}
         theme={Theme.Dark}
       >
-        <div
-          className={classNames({
-            StoryViewsNRepliesModal__content: true,
-            'StoryViewsNRepliesModal--group': Boolean(group),
-          })}
-        >
+        <div className="StoryViewsNRepliesModal__content">
           {tabsElement || (
             <>
               {viewsElement || repliesElement}

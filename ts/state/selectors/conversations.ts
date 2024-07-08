@@ -303,8 +303,9 @@ const collator = new Intl.Collator();
 //   phone numbers and contacts from scratch here again.
 export const _getConversationComparator = () => {
   return (left: ConversationType, right: ConversationType): number => {
-    const leftTimestamp = left.timestamp;
-    const rightTimestamp = right.timestamp;
+    // These two fields can be sorted with each other; they are timestamps
+    const leftTimestamp = left.lastMessageReceivedAtMs || left.timestamp;
+    const rightTimestamp = right.lastMessageReceivedAtMs || right.timestamp;
     if (leftTimestamp && !rightTimestamp) {
       return -1;
     }
@@ -313,6 +314,19 @@ export const _getConversationComparator = () => {
     }
     if (leftTimestamp && rightTimestamp && leftTimestamp !== rightTimestamp) {
       return rightTimestamp - leftTimestamp;
+    }
+
+    // This field looks like a timestamp, but is actually a counter
+    const leftCounter = left.lastMessageReceivedAt;
+    const rightCounter = right.lastMessageReceivedAt;
+    if (leftCounter && !rightCounter) {
+      return -1;
+    }
+    if (rightCounter && !leftCounter) {
+      return 1;
+    }
+    if (leftCounter && rightCounter && leftCounter !== rightCounter) {
+      return rightCounter - leftCounter;
     }
 
     if (
@@ -848,43 +862,66 @@ export const getCachedSelectorForConversation = createSelector(
   }
 );
 
-export type GetConversationByIdType = (id?: string) => ConversationType;
-export const getConversationSelector = createSelector(
-  getCachedSelectorForConversation,
+export type GetConversationByAnyIdSelectorType = (
+  id?: string
+) => ConversationType | undefined;
+export const getConversationByAnyIdSelector = createSelector(
   getConversationLookup,
   getConversationsByServiceId,
   getConversationsByE164,
   getConversationsByGroupId,
   (
-    selector: CachedConversationSelectorType,
     byId: ConversationLookupType,
     byServiceId: ConversationLookupType,
     byE164: ConversationLookupType,
     byGroupId: ConversationLookupType
+  ): GetConversationByAnyIdSelectorType => {
+    return (id?: string) => {
+      if (!id) {
+        return undefined;
+      }
+
+      const onGroupId = getOwn(byGroupId, id);
+      if (onGroupId) {
+        return onGroupId;
+      }
+      const onServiceId = getOwn(
+        byServiceId,
+        normalizeServiceId(id, 'getConversationSelector')
+      );
+      if (onServiceId) {
+        return onServiceId;
+      }
+      const onE164 = getOwn(byE164, id);
+      if (onE164) {
+        return onE164;
+      }
+      const onId = getOwn(byId, id);
+      if (onId) {
+        return onId;
+      }
+
+      return undefined;
+    };
+  }
+);
+
+export type GetConversationByIdType = (id?: string) => ConversationType;
+export const getConversationSelector = createSelector(
+  getCachedSelectorForConversation,
+  getConversationByAnyIdSelector,
+  (
+    selector: CachedConversationSelectorType,
+    getById: GetConversationByAnyIdSelectorType
   ): GetConversationByIdType => {
     return (id?: string) => {
       if (!id) {
         return selector(undefined);
       }
 
-      const onServiceId = getOwn(
-        byServiceId,
-        normalizeServiceId(id, 'getConversationSelector')
-      );
-      if (onServiceId) {
-        return selector(onServiceId);
-      }
-      const onE164 = getOwn(byE164, id);
-      if (onE164) {
-        return selector(onE164);
-      }
-      const onGroupId = getOwn(byGroupId, id);
-      if (onGroupId) {
-        return selector(onGroupId);
-      }
-      const onId = getOwn(byId, id);
-      if (onId) {
-        return selector(onId);
+      const byId = getById(id);
+      if (byId) {
+        return selector(byId);
       }
 
       log.warn(`getConversationSelector: No conversation found for id ${id}`);

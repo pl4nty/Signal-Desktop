@@ -23,12 +23,19 @@ export type RenderTextCallbackType = (options: {
 
 export { ICUJSXMessageParamsByKeyType, ICUStringMessageParamsByKeyType };
 
+export type LocalizerOptions = {
+  textIsBidiFreeSkipNormalization?: boolean;
+};
+
 export type LocalizerType = {
   <Key extends keyof ICUStringMessageParamsByKeyType>(
     key: Key,
     ...values: ICUStringMessageParamsByKeyType[Key] extends undefined
-      ? [undefined?]
-      : [ICUStringMessageParamsByKeyType[Key]]
+      ? [params?: undefined, options?: LocalizerOptions]
+      : [
+          params: ICUStringMessageParamsByKeyType[Key],
+          options?: LocalizerOptions
+        ]
   ): string;
   getIntl(): IntlShape;
   getLocale(): string;
@@ -89,3 +96,6 @@ export type JSONWithUnknownFields<Value> = Value extends Record<
   : Value extends Array<infer E>
   ? ReadonlyArray<JSONWithUnknownFields<E>>
   : Value;
+
+export type WithRequiredProperties<T, P extends keyof T> = Omit<T, P> &
+  Required<Pick<T, P>>;

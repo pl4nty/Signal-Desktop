@@ -6,7 +6,7 @@ import React, { useState } from 'react';
 import { get } from 'lodash';
 
 import * as log from '../../logging/log';
-import { Intl } from '../Intl';
+import { I18n } from '../I18n';
 import type {
   LocalizerType,
   ICUJSXMessageParamsByKeyType,
@@ -29,16 +29,16 @@ import { ConfirmationDialog } from '../ConfirmationDialog';
 
 export type PropsDataType = {
   areWeAdmin: boolean;
+  change: GroupV2ChangeType;
   conversationId: string;
+  groupBannedMemberships?: ReadonlyArray<ServiceIdString>;
   groupMemberships?: ReadonlyArray<{
     aci: AciString;
     isAdmin: boolean;
   }>;
-  groupBannedMemberships?: ReadonlyArray<ServiceIdString>;
   groupName?: string;
   ourAci: AciString | undefined;
   ourPni: PniString | undefined;
-  change: GroupV2ChangeType;
 };
 
 export type PropsActionsType = {
@@ -62,7 +62,7 @@ function renderStringToIntl<Key extends keyof ICUJSXMessageParamsByKeyType>(
   i18n: LocalizerType,
   components: ICUJSXMessageParamsByKeyType[Key]
 ): JSX.Element {
-  return <Intl id={id} i18n={i18n} components={components} />;
+  return <I18n id={id} i18n={i18n} components={components} />;
 }
 
 enum ModalState {
@@ -229,7 +229,7 @@ function GroupV2Detail({
           i18n={i18n}
           onClose={() => setModalState(ModalState.None)}
         >
-          <Intl
+          <I18n
             id="icu:PendingRequests--block--contents"
             i18n={i18n}
             components={{

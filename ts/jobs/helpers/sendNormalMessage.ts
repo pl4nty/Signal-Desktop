@@ -3,6 +3,7 @@
 
 import { isNumber } from 'lodash';
 import PQueue from 'p-queue';
+import { v4 as generateUuid } from 'uuid';
 
 import * as Errors from '../../types/errors';
 import { strictAssert } from '../../util/assert';
@@ -589,6 +590,7 @@ async function getMessageSendData({
 
     maybeLongAttachment = {
       contentType: LONG_MESSAGE,
+      clientUuid: generateUuid(),
       fileName: `long-message-${targetTimestamp}.txt`,
       data,
       size: data.byteLength,
@@ -779,8 +781,7 @@ async function uploadMessageQuote({
     prop: 'quote',
     targetTimestamp,
   });
-  const loadedQuote =
-    message.cachedOutgoingQuoteData || (await loadQuoteData(startingQuote));
+  const loadedQuote = await loadQuoteData(startingQuote);
 
   if (!loadedQuote) {
     return undefined;
@@ -790,14 +791,17 @@ async function uploadMessageQuote({
     loadedQuote.attachments.map(
       attachment => async (): Promise<OutgoingQuoteAttachmentType> => {
         const { thumbnail } = attachment;
-        if (!thumbnail) {
+        if (!thumbnail || !thumbnail.data) {
           return {
             contentType: attachment.contentType,
             fileName: attachment.fileName,
           };
         }
 
-        const uploaded = await uploadAttachment(thumbnail);
+        const uploaded = await uploadAttachment({
+          ...thumbnail,
+          data: thumbnail.data,
+        });
 
         return {
           contentType: attachment.contentType,
@@ -826,13 +830,9 @@ async function uploadMessageQuote({
       }
 
       strictAssert(
-        attachment.path === loadedQuote.attachments.at(index)?.path,
+        attachment.thumbnail.path ===
+          loadedQuote.attachments.at(index)?.thumbnail?.path,
         `${logId}: Quote attachment ${index} was updated from under us`
-      );
-
-      strictAssert(
-        attachment.thumbnail,
-        `${logId}: Quote attachment ${index} no longer has a thumbnail`
       );
 
       const attachmentAfterThumbnailUpload =
@@ -891,9 +891,7 @@ async function uploadMessagePreviews({
     targetTimestamp,
   });
 
-  const loadedPreviews =
-    message.cachedOutgoingPreviewData ||
-    (await loadPreviewData(startingPreview));
+  const loadedPreviews = await loadPreviewData(startingPreview);
 
   if (!loadedPreviews) {
     return undefined;
@@ -975,9 +973,7 @@ async function uploadMessageSticker(
   // See uploadMessageQuote for comment on how we do caching for these
   // attachments.
   const startingSticker = message.get('sticker');
-  const stickerWithData =
-    message.cachedOutgoingStickerData ||
-    (await loadStickerData(startingSticker));
+  const stickerWithData = await loadStickerData(startingSticker);
 
   if (!stickerWithData) {
     return undefined;
@@ -1021,9 +1017,7 @@ async function uploadMessageContacts(
 
   // See uploadMessageQuote for comment on how we do caching for these
   // attachments.
-  const contacts =
-    message.cachedOutgoingContactData ||
-    (await loadContactData(message.get('contact')));
+  const contacts = await loadContactData(message.get('contact'));
 
   if (!contacts) {
     return undefined;

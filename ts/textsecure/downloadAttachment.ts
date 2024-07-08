@@ -10,112 +10,140 @@ import { ensureFile } from 'fs-extra';
 import * as log from '../logging/log';
 import * as Errors from '../types/errors';
 import { strictAssert } from '../util/assert';
-import { dropNull } from '../util/dropNull';
 import {
   AttachmentSizeError,
+  mightBeOnBackupTier,
   type AttachmentType,
-  type DownloadedAttachmentType,
 } from '../types/Attachment';
 import * as MIME from '../types/MIME';
 import * as Bytes from '../Bytes';
-import { getFirstBytes, decryptAttachmentV1 } from '../Crypto';
+import {
+  deriveBackupMediaKeyMaterial,
+  type BackupMediaKeyMaterialType,
+} from '../Crypto';
 import {
   decryptAttachmentV2,
-  getAttachmentDownloadSize,
+  getAttachmentCiphertextLength,
   safeUnlinkSync,
+  splitKeys,
 } from '../AttachmentCrypto';
 import type { ProcessedAttachment } from './Types.d';
 import type { WebAPIType } from './WebAPI';
 import { createName, getRelativePath } from '../windows/attachments';
+import { MediaTier } from '../types/AttachmentDownload';
+import { getBackupKey } from '../services/backups/crypto';
+import { backupsService } from '../services/backups';
+import { getMediaIdForAttachment } from '../services/backups/util/mediaId';
 
-export function getCdn(attachment: ProcessedAttachment): string {
-  const { cdnId, cdnKey } = attachment;
-  const cdn = cdnId || cdnKey;
-  strictAssert(cdn, 'Attachment was missing cdnId or cdnKey');
-  return cdn;
+const DEFAULT_BACKUP_CDN_NUMBER = 3;
+
+export function getCdnKey(attachment: ProcessedAttachment): string {
+  const cdnKey = attachment.cdnId || attachment.cdnKey;
+  strictAssert(cdnKey, 'Attachment was missing cdnId or cdnKey');
+  return cdnKey;
 }
 
-export async function downloadAttachmentV1(
+function getBackupMediaKeyMaterial(
+  attachment: AttachmentType
+): BackupMediaKeyMaterialType {
+  const mediaId = getMediaIdForAttachment(attachment);
+  const backupKey = getBackupKey();
+  return deriveBackupMediaKeyMaterial(backupKey, mediaId.bytes);
+}
+
+export async function getCdnNumberForBackupTier(
+  attachment: ProcessedAttachment
+): Promise<number> {
+  strictAssert(
+    attachment.backupLocator,
+    'Attachment was missing backupLocator'
+  );
+  let backupCdnNumber = attachment.backupLocator.cdnNumber;
+
+  if (backupCdnNumber == null) {
+    const mediaId = getMediaIdForAttachment(attachment);
+    const backupCdnInfo = await backupsService.getBackupCdnInfo(mediaId.string);
+    if (backupCdnInfo.isInBackupTier) {
+      backupCdnNumber = backupCdnInfo.cdnNumber;
+    } else {
+      backupCdnNumber = DEFAULT_BACKUP_CDN_NUMBER;
+    }
+  }
+  return backupCdnNumber;
+}
+
+export async function downloadAttachment(
   server: WebAPIType,
   attachment: ProcessedAttachment,
   options?: {
     disableRetries?: boolean;
     timeout?: number;
-  }
-): Promise<DownloadedAttachmentType> {
-  const { cdnNumber, key, digest, size, contentType } = attachment;
-  const cdn = getCdn(attachment);
-
-  const encrypted = await server.getAttachment(
-    cdn,
-    dropNull(cdnNumber),
-    options
-  );
-
-  strictAssert(digest, 'Failure: Ask sender to update Signal and resend.');
-  strictAssert(key, 'attachment has no key');
-
-  const paddedData = decryptAttachmentV1(
-    encrypted,
-    Bytes.fromBase64(key),
-    Bytes.fromBase64(digest)
-  );
-
-  if (!isNumber(size)) {
-    throw new Error(
-      `downloadAttachment: Size was not provided, actual size was ${paddedData.byteLength}`
-    );
-  }
-
-  const data = getFirstBytes(paddedData, size);
-
-  return {
-    ...attachment,
-    size,
-    contentType: contentType
-      ? MIME.stringToMIMEType(contentType)
-      : MIME.APPLICATION_OCTET_STREAM,
-    data,
-  };
-}
-
-export async function downloadAttachmentV2(
-  server: WebAPIType,
-  attachment: ProcessedAttachment,
-  options?: {
-    disableRetries?: boolean;
-    timeout?: number;
+    mediaTier?: MediaTier;
+    logPrefix?: string;
   }
 ): Promise<AttachmentType> {
-  const { cdnNumber, contentType, digest, key, size } = attachment;
-  const cdn = getCdn(attachment);
-  const logId = `downloadAttachmentV2(${cdn}):`;
+  const logId = `${options?.logPrefix}/downloadAttachment`;
+
+  const { digest, key, size, contentType } = attachment;
 
   strictAssert(digest, `${logId}: missing digest`);
   strictAssert(key, `${logId}: missing key`);
   strictAssert(isNumber(size), `${logId}: missing size`);
 
-  const downloadStream = await server.getAttachmentV2(
-    cdn,
-    dropNull(cdnNumber),
-    options
-  );
-  log.info(`${logId} got download stream`);
+  const mediaTier =
+    options?.mediaTier ??
+    (mightBeOnBackupTier(attachment) ? MediaTier.BACKUP : MediaTier.STANDARD);
 
-  const cipherTextRelativePath = await downloadToDisk({ downloadStream, size });
-  log.info(`${logId} downloaded encrypted file to disk`);
+  let downloadedPath: string;
+  if (mediaTier === MediaTier.STANDARD) {
+    const cdnKey = getCdnKey(attachment);
+    const { cdnNumber } = attachment;
+
+    const downloadStream = await server.getAttachment({
+      cdnKey,
+      cdnNumber,
+      options,
+    });
+    downloadedPath = await downloadToDisk({ downloadStream, size });
+  } else {
+    const mediaId = getMediaIdForAttachment(attachment);
+    const cdnNumber = await getCdnNumberForBackupTier(attachment);
+    const cdnCredentials =
+      await backupsService.credentials.getCDNReadCredentials(cdnNumber);
+
+    const backupDir = await backupsService.api.getBackupDir();
+    const mediaDir = await backupsService.api.getMediaDir();
+
+    const downloadStream = await server.getAttachmentFromBackupTier({
+      mediaId: mediaId.string,
+      backupDir,
+      mediaDir,
+      headers: cdnCredentials.headers,
+      cdnNumber,
+      options,
+    });
+    downloadedPath = await downloadToDisk({
+      downloadStream,
+      size: getAttachmentCiphertextLength(size),
+    });
+  }
 
   const cipherTextAbsolutePath =
-    window.Signal.Migrations.getAbsoluteAttachmentPath(cipherTextRelativePath);
+    window.Signal.Migrations.getAbsoluteAttachmentPath(downloadedPath);
 
-  const { path, plaintextHash } = await decryptAttachmentV2({
+  const { aesKey, macKey } = splitKeys(Bytes.fromBase64(key));
+  const { path, plaintextHash, iv } = await decryptAttachmentV2({
     ciphertextPath: cipherTextAbsolutePath,
-    id: cdn,
-    keys: Bytes.fromBase64(key),
+    idForLogging: logId,
+    aesKey,
+    macKey,
     size,
     theirDigest: Bytes.fromBase64(digest),
+    outerEncryption:
+      mediaTier === 'backup'
+        ? getBackupMediaKeyMaterial(attachment)
+        : undefined,
   });
-  log.info(`${logId} successfully decrypted`);
 
   safeUnlinkSync(cipherTextAbsolutePath);
 
@@ -127,6 +155,7 @@ export async function downloadAttachmentV2(
       ? MIME.stringToMIMEType(contentType)
       : MIME.APPLICATION_OCTET_STREAM,
     plaintextHash,
+    iv: Bytes.toBase64(iv),
   };
 }
 
@@ -142,7 +171,7 @@ async function downloadToDisk({
     window.Signal.Migrations.getAbsoluteAttachmentPath(relativeTargetPath);
   await ensureFile(absoluteTargetPath);
   const writeStream = createWriteStream(absoluteTargetPath);
-  const targetSize = getAttachmentDownloadSize(size);
+  const targetSize = getAttachmentCiphertextLength(size);
 
   try {
     await pipeline(downloadStream, checkSize(targetSize), writeStream);
@@ -165,17 +194,27 @@ async function downloadToDisk({
 // A simple transform that throws if it sees more than maxBytes on the stream.
 function checkSize(expectedBytes: number) {
   let totalBytes = 0;
+
+  // TODO (DESKTOP-7046): remove size buffer
+  const maximumSizeBeforeError = expectedBytes * 1.05;
   return new Transform({
     transform(chunk, encoding, callback) {
       totalBytes += chunk.byteLength;
-      if (totalBytes > expectedBytes) {
+      if (totalBytes > maximumSizeBeforeError) {
         callback(
           new AttachmentSizeError(
-            `checkSize: Received ${totalBytes} bytes, max is ${expectedBytes}, `
+            `checkSize: Received ${totalBytes} bytes, max is ${maximumSizeBeforeError}`
           )
         );
         return;
       }
+
+      if (totalBytes > expectedBytes) {
+        log.warn(
+          `checkSize: Received ${totalBytes} bytes, expected ${expectedBytes}`
+        );
+      }
+
       this.push(chunk, encoding);
       callback();
     },

@@ -8,6 +8,7 @@ import type * as Backbone from 'backbone';
 import type PQueue from 'p-queue/dist';
 import type { assert } from 'chai';
 import type { PhoneNumber, PhoneNumberFormat } from 'google-libphonenumber';
+import type { MochaOptions } from 'mocha';
 
 import type { ConversationModelCollectionType } from './model-types.d';
 import type { textsecure } from './textsecure';
@@ -39,6 +40,7 @@ import type { BatcherType } from './util/batcher';
 import type { ConfirmationDialog } from './components/ConfirmationDialog';
 import type { SignalProtocolStore } from './SignalProtocolStore';
 import type { SocketStatus } from './types/SocketStatus';
+import type { ScreenShareStatus } from './types/Calling';
 import type SyncRequest from './textsecure/SyncRequest';
 import type { MessageCache } from './services/MessageCache';
 import type { StateType } from './state/reducer';
@@ -122,6 +124,8 @@ type PermissionsWindowPropsType = {
 type ScreenShareWindowPropsType = {
   onStopSharing: () => void;
   presentedSourceName: string;
+  getStatus: () => ScreenShareStatus;
+  setRenderCallback: (cb: () => void) => void;
 };
 
 type SettingsOnRenderCallbackType = (props: PreferencesPropsType) => void;
@@ -179,7 +183,6 @@ declare global {
     // Used for sticker creator localization
     localeMessages: { [key: string]: { message: string } };
 
-    isBehindProxy: () => boolean;
     openArtCreator: (opts: { username: string; password: string }) => void;
 
     enterKeyboardMode: () => void;
@@ -194,7 +197,9 @@ declare global {
     getInteractionMode: () => 'mouse' | 'keyboard';
     getServerPublicParams: () => string;
     getGenericServerPublicParams: () => string;
+    getBackupServerPublicParams: () => string;
     getSfuUrl: () => string;
+    getIceServerOverride: () => string;
     getSocketStatus: () => SocketStatus;
     getSyncRequest: (timeoutMillis?: number) => SyncRequest;
     getTitle: () => string;
@@ -275,9 +280,10 @@ declare global {
     RETRY_DELAY: boolean;
     assert: typeof assert;
     testUtilities: {
+      setup: MochaOptions;
       debug: (info: unknown) => void;
+      onTestEvent: (event: unknown) => void;
       initialize: () => Promise<void>;
-      onComplete: (info: unknown) => void;
       prepareTests: () => void;
     };
   }

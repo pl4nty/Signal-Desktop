@@ -3,6 +3,7 @@
 
 import type { ThunkAction } from 'redux-thunk';
 import {
+  chunk,
   difference,
   fromPairs,
   isEqual,
@@ -127,7 +128,7 @@ import { missingCaseError } from '../../util/missingCaseError';
 import { viewSyncJobQueue } from '../../jobs/viewSyncJobQueue';
 import { ReadStatus } from '../../messages/MessageReadStatus';
 import { isIncoming, processBodyRanges } from '../selectors/message';
-import { getActiveCallState } from '../selectors/calling';
+import { getActiveCall, getActiveCallState } from '../selectors/calling';
 import { sendDeleteForEveryoneMessage } from '../../util/sendDeleteForEveryoneMessage';
 import type { ShowToastActionType } from './toast';
 import { SHOW_TOAST } from './toast';
@@ -167,7 +168,7 @@ import {
   setComposerFocus,
   setQuoteByMessageId,
   resetComposer,
-  handleLeaveConversation,
+  saveDraftRecordingIfNeeded,
 } from './composer';
 import { ReceiptType } from '../../types/Receipt';
 import { Sound, SoundType } from '../../util/Sound';
@@ -183,6 +184,19 @@ import { getAddedByForOurPendingInvitation } from '../../util/getAddedByForOurPe
 import { getConversationIdForLogging } from '../../util/idForLogging';
 import { singleProtoJobQueue } from '../../jobs/singleProtoJobQueue';
 import MessageSender from '../../textsecure/SendMessage';
+import { AttachmentDownloadUrgency } from '../../jobs/AttachmentDownloadManager';
+import type {
+  DeleteForMeSyncEventData,
+  MessageToDelete,
+} from '../../textsecure/messageReceiverEvents';
+import {
+  getConversationToDelete,
+  getMessageToDelete,
+} from '../../util/deleteForMe';
+import { MAX_MESSAGE_COUNT } from '../../util/deleteForMe.types';
+import { isEnabled } from '../../RemoteConfig';
+import { markCallHistoryReadInConversation } from './callHistory';
+import type { CapabilitiesType } from '../../textsecure/WebAPI';
 
 // State
 
@@ -243,6 +257,9 @@ export type ConversationType = ReadonlyDeep<
     pni?: PniString;
     e164?: string;
     name?: string;
+    nicknameGivenName?: string;
+    nicknameFamilyName?: string;
+    note?: string;
     systemGivenName?: string;
     systemFamilyName?: string;
     systemNickname?: string;
@@ -250,6 +267,7 @@ export type ConversationType = ReadonlyDeep<
     firstName?: string;
     profileName?: string;
     profileLastUpdatedAt?: number;
+    capabilities?: CapabilitiesType;
     username?: string;
     about?: string;
     aboutText?: string;
@@ -282,6 +300,8 @@ export type ConversationType = ReadonlyDeep<
     isVerified?: boolean;
     activeAt?: number;
     timestamp?: number;
+    lastMessageReceivedAt?: number;
+    lastMessageReceivedAtMs?: number;
     inboxPosition?: number;
     left?: boolean;
     lastMessage?: LastMessageType;
@@ -315,6 +335,7 @@ export type ConversationType = ReadonlyDeep<
     sortedGroupMembers?: ReadonlyArray<ConversationType>;
     title: string;
     titleNoDefault?: string;
+    titleNoNickname?: string;
     searchableTitle?: string;
     unreadCount?: number;
     unreadMentionsCount?: number;
@@ -1156,6 +1177,7 @@ export const actions = {
   updateConversationModelSharedGroups,
   updateGroupAttributes,
   updateLastMessage,
+  updateNicknameAndNote,
   updateSharedGroups,
   verifyConversationsStoppingSend,
 };
@@ -1337,7 +1359,7 @@ function markMessageRead(
   conversationId: string,
   messageId: string
 ): ThunkAction<void, RootStateType, unknown, NoopActionType> {
-  return async (_dispatch, getState) => {
+  return async (dispatch, getState) => {
     const conversation = window.ConversationController.get(conversationId);
     if (!conversation) {
       throw new Error('markMessageRead: Conversation not found!');
@@ -1361,6 +1383,12 @@ function markMessageRead(
       newestSentAt: message.get('sent_at'),
       sendReadReceipts: true,
     });
+
+    if (message.get('type') === 'call-history') {
+      const callId = message.get('callId');
+      strictAssert(callId, 'callId not found');
+      dispatch(markCallHistoryReadInConversation(callId));
+    }
   };
 }
 
@@ -1695,21 +1723,27 @@ function deleteMessages({
       throw new Error('deleteMessage: No conversation found');
     }
 
-    await Promise.all(
-      messageIds.map(async messageId => {
-        const message = await __DEPRECATED$getMessageById(messageId);
-        if (!message) {
-          throw new Error(`deleteMessages: Message ${messageId} missing!`);
-        }
+    const messages = (
+      await Promise.all(
+        messageIds.map(
+          async (messageId): Promise<MessageToDelete | undefined> => {
+            const message = await __DEPRECATED$getMessageById(messageId);
+            if (!message) {
+              throw new Error(`deleteMessages: Message ${messageId} missing!`);
+            }
 
-        const messageConversationId = message.get('conversationId');
-        if (conversationId !== messageConversationId) {
-          throw new Error(
-            `deleteMessages: message conversation ${messageConversationId} doesn't match provided conversation ${conversationId}`
-          );
-        }
-      })
-    );
+            const messageConversationId = message.get('conversationId');
+            if (conversationId !== messageConversationId) {
+              throw new Error(
+                `deleteMessages: message conversation ${messageConversationId} doesn't match provided conversation ${conversationId}`
+              );
+            }
+
+            return getMessageToDelete(message.attributes);
+          }
+        )
+      )
+    ).filter(isNotNil);
 
     let nearbyMessageId: string | null = null;
 
@@ -1728,13 +1762,47 @@ function deleteMessages({
       }
     }
 
-    await window.Signal.Data.removeMessages(messageIds);
+    await window.Signal.Data.removeMessages(messageIds, {
+      singleProtoJobQueue,
+    });
 
     popPanelForConversation()(dispatch, getState, undefined);
 
     if (nearbyMessageId != null) {
       dispatch(scrollToMessage(conversationId, nearbyMessageId));
     }
+
+    const ourConversation =
+      window.ConversationController.getOurConversationOrThrow();
+    const capable = Boolean(ourConversation.get('capabilities')?.deleteSync);
+
+    if (!capable || !isEnabled('desktop.deleteSync.send')) {
+      return;
+    }
+    if (messages.length === 0) {
+      return;
+    }
+
+    const chunks = chunk(messages, MAX_MESSAGE_COUNT);
+    const conversationToDelete = getConversationToDelete(
+      conversation.attributes
+    );
+    const timestamp = Date.now();
+
+    await Promise.all(
+      chunks.map(async items => {
+        const data: DeleteForMeSyncEventData = items.map(item => ({
+          conversation: conversationToDelete,
+          message: item,
+          timestamp,
+          type: 'delete-message' as const,
+        }));
+
+        await singleProtoJobQueue.add(
+          MessageSender.getDeleteForMeSyncMessage(data)
+        );
+      })
+    );
   };
 }
 
@@ -1762,7 +1830,7 @@ function destroyMessages(
           undefined
         );
 
-        await conversation.destroyMessages();
+        await conversation.destroyMessages({ source: 'local-delete' });
         drop(conversation.updateLastMessage());
       },
     });
@@ -2167,7 +2235,9 @@ function kickOffAttachmentDownload(
         `kickOffAttachmentDownload: Message ${options.messageId} missing!`
       );
     }
-    const didUpdateValues = await message.queueAttachmentDownloads();
+    const didUpdateValues = await message.queueAttachmentDownloads(
+      AttachmentDownloadUrgency.IMMEDIATE
+    );
 
     if (didUpdateValues) {
       drop(
@@ -2423,7 +2493,15 @@ export function cancelConversationVerification(
     });
 
     // Start the blocked conversation queues up again
+    const activeCall = getActiveCall(state);
     conversationIdsBlocked.forEach(conversationId => {
+      if (
+        activeCall &&
+        activeCall.conversationId === conversationId &&
+        activeCall.callMode === CallMode.Direct
+      ) {
+        calling.hangup(conversationId, 'canceled conversation verification');
+      }
       conversationJobQueue.resolveVerificationWaiter(conversationId);
     });
   };
@@ -2741,7 +2819,11 @@ function getProfilesForConversation(conversationId: string): NoopActionType {
     throw new Error('getProfilesForConversation: no conversation found');
   }
 
-  void conversation.getProfiles();
+  drop(
+    conversation.getProfiles().catch(() => {
+      /* nothing to do here; logging already happened */
+    })
+  );
 
   return {
     type: 'NOOP',
@@ -2765,7 +2847,11 @@ function conversationStoppedByMissingVerification(payload: {
     }
 
     // Intentionally not awaiting here
-    void conversation.getProfiles();
+    drop(
+      conversation.getProfiles().catch(() => {
+        /* nothing to do here; logging already happened */
+      })
+    );
   });
 
   return {
@@ -4175,7 +4261,7 @@ function showConversation({
 
     // notify composer in case we need to stop recording a voice note
     if (conversations.selectedConversationId) {
-      dispatch(handleLeaveConversation(conversations.selectedConversationId));
+      saveDraftRecordingIfNeeded()(dispatch, getState, undefined);
       dispatch(
         onConversationClosed(
           conversations.selectedConversationId,
@@ -4274,7 +4360,9 @@ function onConversationOpened(
         conversation.throttledGetProfiles !== undefined,
         'Conversation model should be initialized'
       );
-      await conversation.throttledGetProfiles();
+      await conversation.throttledGetProfiles().catch(() => {
+        /* nothing to do here; logging already happened */
+      });
     }
 
     drop(conversation.updateVerified());
@@ -4311,6 +4399,7 @@ function onConversationClosed(
           draftChanged: false,
           draftTimestamp: now,
           timestamp: now,
+          lastMessageReceivedAtMs: now,
         });
       } else {
         log.info(`${logId}: clearing draft info`);
@@ -4657,6 +4746,44 @@ export function updateLastMessage(
       );
     }
     await conversationModel.updateLastMessage();
+  };
+}
+
+export type NicknameAndNote = ReadonlyDeep<{
+  nickname: {
+    givenName: string | null;
+    familyName: string | null;
+  } | null;
+  note: string | null;
+}>;
+
+function updateNicknameAndNote(
+  conversationId: string,
+  nicknameAndNote: NicknameAndNote
+): ThunkAction<void, RootStateType, unknown, NoopActionType> {
+  return async dispatch => {
+    const { nickname, note } = nicknameAndNote;
+    const conversationModel = window.ConversationController.get(conversationId);
+
+    strictAssert(
+      conversationModel != null,
+      'updateNicknameAndNote: Conversation not found'
+    );
+
+    strictAssert(
+      isDirectConversation(conversationModel.attributes),
+      'updateNicknameAndNote: Conversation is not a group'
+    );
+
+    conversationModel.set({
+      nicknameGivenName: nickname?.givenName,
+      nicknameFamilyName: nickname?.familyName,
+      note,
+    });
+    window.Signal.Data.updateConversation(conversationModel.attributes);
+    const conversation = conversationModel.format();
+    dispatch(conversationChanged(conversationId, conversation));
+    conversationModel.captureChange('nicknameAndNote');
   };
 }
 

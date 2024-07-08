@@ -1,6 +1,7 @@
 // Copyright 2021 Signal Messenger, LLC
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import type { Net } from '@signalapp/libsignal-client';
 import URL from 'url';
 import type { RequestInit, Response } from 'node-fetch';
 import { Headers } from 'node-fetch';
@@ -35,7 +36,7 @@ import WebSocketResource, {
   TransportOption,
   WebSocketResourceWithShadowing,
 } from './WebsocketResources';
-import { HTTPError } from './Errors';
+import { ConnectTimeoutError, HTTPError } from './Errors';
 import type { IRequestHandler, WebAPICredentials } from './Types.d';
 import { connect as connectWebSocket } from './WebSocket';
 import { isAlpha, isBeta, isStaging } from '../util/version';
@@ -51,7 +52,6 @@ export const AUTHENTICATED_CHANNEL_NAME = 'authenticated';
 
 export type SocketManagerOptions = Readonly<{
   url: string;
-  artCreatorUrl: string;
   certificateAuthority: string;
   version: string;
   proxyUrl?: string;
@@ -85,7 +85,7 @@ export class SocketManager extends EventListener {
 
   private credentials?: WebAPICredentials;
 
-  private proxyAgent?: ProxyAgent;
+  private lazyProxyAgent?: Promise<ProxyAgent>;
 
   private status = SocketStatus.CLOSED;
 
@@ -103,7 +103,10 @@ export class SocketManager extends EventListener {
 
   private reconnectController: AbortController | undefined;
 
-  constructor(private readonly options: SocketManagerOptions) {
+  constructor(
+    private readonly libsignalNet: Net.Net,
+    private readonly options: SocketManagerOptions
+  ) {
     super();
 
     this.hasStoriesDisabled = options.hasStoriesDisabled;
@@ -111,6 +114,13 @@ export class SocketManager extends EventListener {
 
   public getStatus(): SocketStatus {
     return this.status;
+  }
+
+  private markOffline() {
+    if (this.privIsOnline !== false) {
+      this.privIsOnline = false;
+      this.emit('offline');
+    }
   }
 
   // Update WebAPICredentials and reconnect authenticated resource if
@@ -160,6 +170,7 @@ export class SocketManager extends EventListener {
       name: AUTHENTICATED_CHANNEL_NAME,
       path: '/v1/websocket/',
       query: { login: username, password },
+      proxyAgent: await this.getProxyAgent(),
       resourceOptions: {
         name: AUTHENTICATED_CHANNEL_NAME,
         keepalive: { path: '/v1/keepalive' },
@@ -252,10 +263,11 @@ export class SocketManager extends EventListener {
           return;
         }
 
-        if (code === -1 && this.privIsOnline !== false) {
-          this.privIsOnline = false;
-          this.emit('offline');
+        if (code === -1) {
+          this.markOffline();
         }
+      } else if (error instanceof ConnectTimeoutError) {
+        this.markOffline();
       }
 
       drop(reconnect());
@@ -317,6 +329,7 @@ export class SocketManager extends EventListener {
     return this.connectResource({
       name: 'provisioning',
       path: '/v1/websocket/provisioning/',
+      proxyAgent: await this.getProxyAgent(),
       resourceOptions: {
         name: 'provisioning',
         handleRequest: (req: IncomingWebSocketRequest): void => {
@@ -335,16 +348,13 @@ export class SocketManager extends EventListener {
     url: string;
     extraHeaders?: Record<string, string>;
   }): Promise<WebSocket> {
-    // Create proxy agent lazily
-    if (this.options.proxyUrl && !this.proxyAgent) {
-      this.proxyAgent = await createProxyAgent(this.options.proxyUrl);
-    }
+    const proxyAgent = await this.getProxyAgent();
 
     return connectWebSocket({
       name: 'art-creator-provisioning',
       url,
       version: this.options.version,
-      proxyAgent: this.proxyAgent,
+      proxyAgent,
       extraHeaders,
 
       createResource(socket: WebSocket): WebSocket {
@@ -499,8 +509,8 @@ export class SocketManager extends EventListener {
     this.credentials = undefined;
   }
 
-  public get isOnline(): boolean {
-    return this.privIsOnline !== false;
+  public get isOnline(): boolean | undefined {
+    return this.privIsOnline;
   }
 
   //
@@ -521,15 +531,11 @@ export class SocketManager extends EventListener {
     }
   }
 
-  private transportOption(): TransportOption {
+  private transportOption(proxyAgent: ProxyAgent | undefined): TransportOption {
     const { hostname } = URL.parse(this.options.url);
 
     // transport experiment doesn't support proxy
-    if (
-      this.proxyAgent ||
-      hostname == null ||
-      !hostname.endsWith('signal.org')
-    ) {
+    if (proxyAgent || hostname == null || !hostname.endsWith('signal.org')) {
       return TransportOption.Original;
     }
 
@@ -560,19 +566,18 @@ export class SocketManager extends EventListener {
         : TransportOption.ShadowingLow;
     }
 
-    // in prod, using original
-    return TransportOption.ShadowingLow;
+    const configValue = window.Signal.RemoteConfig.isEnabled(
+      'desktop.experimentalTransportEnabled.prod'
+    );
+    return configValue
+      ? TransportOption.ShadowingLow
+      : TransportOption.Original;
   }
 
   private connectLibsignalUnauthenticated(): AbortableProcess<IWebSocketResource> {
-    return new AbortableProcess<IWebSocketResource>(
-      `WebSocket.connect(libsignal.${UNAUTHENTICATED_CHANNEL_NAME})`,
-      {
-        abort() {
-          // noop
-        },
-      },
-      Promise.resolve(new LibsignalWebSocketResource(this.options.version))
+    return LibsignalWebSocketResource.connect(
+      this.libsignalNet,
+      UNAUTHENTICATED_CHANNEL_NAME
     );
   }
 
@@ -591,25 +596,30 @@ export class SocketManager extends EventListener {
 
     log.info('SocketManager: connecting unauthenticated socket');
 
-    const transportOption = this.transportOption();
+    const proxyAgent = await this.getProxyAgent();
+
+    const transportOption = this.transportOption(proxyAgent);
     log.info(
       `SocketManager: connecting unauthenticated socket, transport option [${transportOption}]`
     );
 
+    let process: AbortableProcess<IWebSocketResource>;
+
     if (transportOption === TransportOption.Libsignal) {
-      this.unauthenticated = this.connectLibsignalUnauthenticated();
-      return this.unauthenticated.getResult();
+      process = this.connectLibsignalUnauthenticated();
+    } else {
+      process = this.connectResource({
+        name: UNAUTHENTICATED_CHANNEL_NAME,
+        path: '/v1/websocket/',
+        proxyAgent,
+        resourceOptions: {
+          name: UNAUTHENTICATED_CHANNEL_NAME,
+          keepalive: { path: '/v1/keepalive' },
+          transportOption,
+        },
+      });
     }
 
-    const process = this.connectResource({
-      name: UNAUTHENTICATED_CHANNEL_NAME,
-      path: '/v1/websocket/',
-      resourceOptions: {
-        name: UNAUTHENTICATED_CHANNEL_NAME,
-        keepalive: { path: '/v1/keepalive' },
-        transportOption,
-      },
-    });
     this.unauthenticated = process;
 
     let unauthenticated: IWebSocketResource;
@@ -647,12 +657,14 @@ export class SocketManager extends EventListener {
   private connectResource({
     name,
     path,
+    proxyAgent,
     resourceOptions,
     query = {},
     extraHeaders = {},
   }: {
     name: string;
     path: string;
+    proxyAgent: ProxyAgent | undefined;
     resourceOptions: WebSocketResourceOptions;
     query?: Record<string, string>;
     extraHeaders?: Record<string, string>;
@@ -666,26 +678,79 @@ export class SocketManager extends EventListener {
     const url = `${this.options.url}${path}?${qs.encode(queryWithDefaults)}`;
     const { version } = this.options;
 
-    return connectWebSocket({
+    const start = performance.now();
+    const webSocketResourceConnection = connectWebSocket({
       name,
       url,
       version,
       certificateAuthority: this.options.certificateAuthority,
-      proxyAgent: this.proxyAgent,
+      proxyAgent,
 
       extraHeaders,
 
-      createResource(socket: WebSocket): IWebSocketResource {
-        return !resourceOptions.transportOption ||
-          resourceOptions.transportOption === TransportOption.Original
-          ? new WebSocketResource(socket, resourceOptions)
-          : new WebSocketResourceWithShadowing(
-              socket,
-              resourceOptions,
-              version
-            );
+      createResource(socket: WebSocket): WebSocketResource {
+        const duration = (performance.now() - start).toFixed(1);
+        log.info(
+          `WebSocketResource(${resourceOptions.name}) connected in ${duration}ms`
+        );
+        return new WebSocketResource(socket, resourceOptions);
       },
     });
+
+    const shadowingModeEnabled =
+      !resourceOptions.transportOption ||
+      resourceOptions.transportOption === TransportOption.Original;
+    return shadowingModeEnabled
+      ? webSocketResourceConnection
+      : this.connectWithShadowing(webSocketResourceConnection, resourceOptions);
+  }
+
+  /**
+   * A method that takes in an `AbortableProcess<>` that establishes
+   * a `WebSocketResource` connection and wraps it in a process
+   * that also tries to establish a `LibsignalWebSocketResource` connection.
+   *
+   * The shadowing connection will not block the main one (e.g. if it takes
+   * longer to connect) and an error in the shadowing connection will not
+   * affect the overall behavior.
+   *
+   * @param mainConnection an `AbortableProcess<WebSocketResource>` responsible
+   * for establishing a Desktop system WebSocket connection.
+   * @param options `WebSocketResourceOptions` options
+   * @private
+   */
+  private connectWithShadowing(
+    mainConnection: AbortableProcess<WebSocketResource>,
+    options: WebSocketResourceOptions
+  ): AbortableProcess<IWebSocketResource> {
+    // creating an `AbortableProcess` of libsignal websocket connection
+    const shadowingConnection = LibsignalWebSocketResource.connect(
+      this.libsignalNet,
+      options.name
+    );
+    const shadowWrapper = async () => {
+      // if main connection results in an error,
+      // it's propagated as the error of the resulting process
+      const mainSocket = await mainConnection.resultPromise;
+      // here, we're not awaiting on `shadowingConnection.resultPromise`
+      // and just letting `WebSocketResourceWithShadowing`
+      // initiate and handle the result of the shadowing connection attempt
+      return new WebSocketResourceWithShadowing(
+        mainSocket,
+        shadowingConnection,
+        options
+      );
+    };
+    return new AbortableProcess<IWebSocketResource>(
+      `WebSocketResourceWithShadowing.connect(${options.name})`,
+      {
+        abort() {
+          mainConnection.abort();
+          shadowingConnection.abort();
+        },
+      },
+      shadowWrapper()
+    );
   }
 
   private async checkResource(
@@ -822,6 +887,14 @@ export class SocketManager extends EventListener {
       username === this.credentials.username &&
       password === this.credentials.password
     );
+  }
+
+  private async getProxyAgent(): Promise<ProxyAgent | undefined> {
+    if (this.options.proxyUrl && !this.lazyProxyAgent) {
+      // Cache the promise so that we don't import concurrently.
+      this.lazyProxyAgent = createProxyAgent(this.options.proxyUrl);
+    }
+    return this.lazyProxyAgent;
   }
 
   // EventEmitter types

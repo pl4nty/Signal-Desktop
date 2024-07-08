@@ -9,11 +9,13 @@ import { aciSchema } from './ServiceId';
 import { bytesToUuid } from '../util/uuidToBytes';
 import { SignalService as Proto } from '../protobuf';
 import * as Bytes from '../Bytes';
+import { UUID_BYTE_SIZE } from './Crypto';
 
 export enum CallType {
   Audio = 'Audio',
   Video = 'Video',
   Group = 'Group',
+  Adhoc = 'Adhoc',
 }
 
 export enum CallDirection {
@@ -24,6 +26,7 @@ export enum CallDirection {
 export enum CallLogEvent {
   Clear = 'Clear',
   MarkedAsRead = 'MarkedAsRead',
+  MarkedAsReadInConversation = 'MarkedAsReadInConversation',
 }
 
 export enum LocalCallEvent {
@@ -45,27 +48,45 @@ export enum RemoteCallEvent {
 
 export type CallEvent = LocalCallEvent | RemoteCallEvent;
 
-export enum DirectCallStatus {
+export enum CallStatusValue {
   Pending = 'Pending',
   Accepted = 'Accepted',
   Missed = 'Missed',
   Declined = 'Declined',
   Deleted = 'Deleted',
-}
-
-export enum GroupCallStatus {
   GenericGroupCall = 'GenericGroupCall',
   OutgoingRing = 'OutgoingRing',
   Ringing = 'Ringing',
   Joined = 'Joined',
-  // keep these in sync with direct
-  Accepted = DirectCallStatus.Accepted,
-  Missed = DirectCallStatus.Missed,
-  Declined = DirectCallStatus.Declined,
-  Deleted = DirectCallStatus.Deleted,
+  JoinedAdhoc = 'JoinedAdhoc',
 }
 
-export type CallStatus = DirectCallStatus | GroupCallStatus;
+export enum DirectCallStatus {
+  Pending = CallStatusValue.Pending,
+  Accepted = CallStatusValue.Accepted,
+  Missed = CallStatusValue.Missed,
+  Declined = CallStatusValue.Declined,
+  Deleted = CallStatusValue.Deleted,
+}
+
+export enum GroupCallStatus {
+  GenericGroupCall = CallStatusValue.GenericGroupCall,
+  OutgoingRing = CallStatusValue.OutgoingRing,
+  Ringing = CallStatusValue.Ringing,
+  Joined = CallStatusValue.Joined,
+  Accepted = CallStatusValue.Accepted,
+  Missed = CallStatusValue.Missed,
+  Declined = CallStatusValue.Declined,
+  Deleted = CallStatusValue.Deleted,
+}
+
+export enum AdhocCallStatus {
+  Pending = CallStatusValue.Pending,
+  Joined = CallStatusValue.JoinedAdhoc,
+  Deleted = CallStatusValue.Deleted,
+}
+
+export type CallStatus = DirectCallStatus | GroupCallStatus | AdhocCallStatus;
 
 export type CallDetails = Readonly<{
   callId: string;
@@ -75,6 +96,19 @@ export type CallDetails = Readonly<{
   type: CallType;
   direction: CallDirection;
   timestamp: number;
+}>;
+
+export type CallLogEventTarget = Readonly<{
+  timestamp: number;
+  callId: string | null;
+  peerId: AciString | string | null;
+}>;
+
+export type CallLogEventDetails = Readonly<{
+  type: CallLogEvent;
+  timestamp: number;
+  peerId: AciString | string | null;
+  callId: string | null;
 }>;
 
 export type CallEventDetails = CallDetails &
@@ -113,6 +147,7 @@ export type CallHistoryFilterOptions = Readonly<{
 
 export type CallHistoryFilter = Readonly<{
   status: CallHistoryFilterStatus;
+  callLinkRoomIds: ReadonlyArray<string> | null;
   conversationIds: ReadonlyArray<string> | null;
 }>;
 
@@ -133,6 +168,7 @@ const callEventSchema = z.union([
 const callStatusSchema = z.union([
   z.nativeEnum(DirectCallStatus),
   z.nativeEnum(GroupCallStatus),
+  z.nativeEnum(AdhocCallStatus),
 ]);
 
 export const callDetailsSchema = z.object({
@@ -170,11 +206,15 @@ export const callHistoryGroupSchema = z.object({
 }) satisfies z.ZodType<CallHistoryGroup>;
 
 const peerIdInBytesSchema = z.instanceof(Uint8Array).transform(value => {
-  const uuid = bytesToUuid(value);
-  if (uuid != null) {
-    return uuid;
+  // direct conversationId
+  if (value.byteLength === UUID_BYTE_SIZE) {
+    const uuid = bytesToUuid(value);
+    if (uuid != null) {
+      return uuid;
+    }
   }
-  // assuming groupId
+
+  // groupId or call link roomId
   return Bytes.toBase64(value);
 });
 
@@ -193,6 +233,13 @@ export const callEventNormalizeSchema = z.object({
   type: z.nativeEnum(Proto.SyncMessage.CallEvent.Type),
   direction: z.nativeEnum(Proto.SyncMessage.CallEvent.Direction),
   event: z.nativeEnum(Proto.SyncMessage.CallEvent.Event),
+});
+
+export const callLogEventNormalizeSchema = z.object({
+  type: z.nativeEnum(Proto.SyncMessage.CallLogEvent.Type),
+  timestamp: longToNumberSchema,
+  peerId: peerIdInBytesSchema.optional(),
+  callId: longToStringSchema.optional(),
 });
 
 export function isSameCallHistoryGroup(

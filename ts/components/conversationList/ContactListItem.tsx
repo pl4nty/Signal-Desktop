@@ -13,10 +13,11 @@ import { About } from '../conversation/About';
 import { ListTile } from '../ListTile';
 import { Avatar, AvatarSize } from '../Avatar';
 import { ContextMenu } from '../ContextMenu';
-import { Intl } from '../Intl';
+import { I18n } from '../I18n';
 import { ConfirmationDialog } from '../ConfirmationDialog';
 import { isSignalConversation } from '../../util/isSignalConversation';
 import { isInSystemContacts } from '../../util/isInSystemContacts';
+import { InContactsIcon } from '../InContactsIcon';
 
 export type ContactListItemConversationType = Pick<
   ConversationType,
@@ -182,7 +183,7 @@ export const ContactListItem: FunctionComponent<PropsType> = React.memo(
           i18n={i18n}
           onClose={() => setConfirmingBlocking(false)}
           title={
-            <Intl
+            <I18n
               i18n={i18n}
               id="icu:MessageRequests--block-direct-confirm-title"
               components={{
@@ -214,7 +215,7 @@ export const ContactListItem: FunctionComponent<PropsType> = React.memo(
             i18n={i18n}
             onClose={() => setConfirmingRemoving(false)}
             title={
-              <Intl
+              <I18n
                 i18n={i18n}
                 id="icu:ContactListItem__remove-system--title"
                 components={{
@@ -235,7 +236,7 @@ export const ContactListItem: FunctionComponent<PropsType> = React.memo(
             i18n={i18n}
             onClose={() => setConfirmingRemoving(false)}
             title={
-              <Intl
+              <I18n
                 i18n={i18n}
                 id="icu:ContactListItem__remove--title"
                 components={{
@@ -281,7 +282,25 @@ export const ContactListItem: FunctionComponent<PropsType> = React.memo(
             />
           }
           trailing={trailing}
-          title={headerName}
+          title={
+            <>
+              {headerName}
+              {isInSystemContacts({
+                type,
+                name,
+                systemGivenName,
+                systemFamilyName,
+              }) && (
+                <span>
+                  {' '}
+                  <InContactsIcon
+                    className="ContactListItem__contact-icon"
+                    i18n={i18n}
+                  />
+                </span>
+              )}
+            </>
+          }
           subtitle={messageText}
           subtitleMaxLines={1}
           onClick={onClick ? () => onClick(id) : undefined}

@@ -1,19 +1,19 @@
 // Copyright 2020 Signal Messenger, LLC
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { ipcRenderer } from 'electron';
 import type { ThunkAction, ThunkDispatch } from 'redux-thunk';
 import {
   hasScreenCapturePermission,
   openSystemPreferences,
 } from 'mac-screen-capture-permissions';
-import { omit } from 'lodash';
+import { omit, pick } from 'lodash';
 import type { ReadonlyDeep } from 'type-fest';
 import {
   CallLinkRootKey,
   GroupCallEndReason,
   type Reaction as CallReaction,
 } from '@signalapp/ringrtc';
+import { v4 as generateUuid } from 'uuid';
 import { getOwn } from '../../util/getOwn';
 import * as Errors from '../../types/errors';
 import { getIntl, getPlatform } from '../selectors/user';
@@ -32,7 +32,11 @@ import type {
   PresentedSource,
   PresentableSource,
 } from '../../types/Calling';
-import type { CallLinkRestrictions } from '../../types/CallLink';
+import type {
+  CallLinkRestrictions,
+  CallLinkStateType,
+  CallLinkType,
+} from '../../types/CallLink';
 import {
   CALLING_REACTIONS_LIFETIME,
   MAX_CALLING_REACTIONS,
@@ -46,10 +50,16 @@ import {
 } from '../../types/Calling';
 import { callingTones } from '../../util/callingTones';
 import { requestCameraPermissions } from '../../util/callingPermissions';
-import { getRoomIdFromRootKey } from '../../util/callLinks';
+import {
+  CALL_LINK_DEFAULT_STATE,
+  getRoomIdFromRootKey,
+  isCallLinksCreateEnabled,
+  toAdminKeyBytes,
+} from '../../util/callLinks';
+import { sendCallLinkUpdateSync } from '../../util/sendCallLinkUpdateSync';
 import { sleep } from '../../util/sleep';
 import { LatestQueue } from '../../util/LatestQueue';
-import type { AciString } from '../../types/ServiceId';
+import type { AciString, ServiceIdString } from '../../types/ServiceId';
 import type {
   ConversationChangedActionType,
   ConversationRemovedActionType,
@@ -76,11 +86,23 @@ import type { ShowErrorModalActionType } from './globalModals';
 import { SHOW_ERROR_MODAL } from './globalModals';
 import { ButtonVariant } from '../../components/Button';
 import { getConversationIdForLogging } from '../../util/idForLogging';
+import dataInterface from '../../sql/Client';
+import { isAciString } from '../../util/isAciString';
+import type { CallHistoryDetails } from '../../types/CallDisposition';
+import {
+  AdhocCallStatus,
+  CallDirection,
+  CallType,
+} from '../../types/CallDisposition';
+import type { CallHistoryAdd } from './callHistory';
+import { addCallHistory } from './callHistory';
+import { saveDraftRecordingIfNeeded } from './composer';
 
 // State
 
 export type GroupCallPeekInfoType = ReadonlyDeep<{
   acis: Array<AciString>;
+  pendingAcis: Array<AciString>;
   creatorAci?: AciString;
   eraId?: string;
   maxDevices: number;
@@ -151,7 +173,6 @@ export type ActiveCallStateType = {
   pip: boolean;
   presentingSource?: PresentedSource;
   presentingSourcesAvailable?: Array<PresentableSource>;
-  safetyNumberChangedAcis: Array<AciString>;
   settingsDialogOpen: boolean;
   showNeedsScreenRecordingPermissionsWarning?: boolean;
   showParticipantsList: boolean;
@@ -168,20 +189,8 @@ export type AdhocCallsType = {
   [roomId: string]: GroupCallStateType;
 };
 
-export type CallLinkStateType = ReadonlyDeep<{
-  name: string;
-  restrictions: CallLinkRestrictions;
-  expiration: number;
-}>;
-
-export type CallLinksByRoomIdStateType = ReadonlyDeep<
-  CallLinkStateType & {
-    rootKey: string;
-  }
->;
-
 export type CallLinksByRoomIdType = ReadonlyDeep<{
-  [roomId: string]: CallLinksByRoomIdStateType;
+  [roomId: string]: CallLinkType;
 }>;
 
 // eslint-disable-next-line local-rules/type-alias-readonlydeep
@@ -242,16 +251,17 @@ type GroupCallStateChangeActionPayloadType =
     ourAci: AciString;
   };
 
+type HandleCallLinkUpdateActionPayloadType = ReadonlyDeep<{
+  callLink: CallLinkType;
+}>;
+
 type HangUpActionPayloadType = ReadonlyDeep<{
   conversationId: string;
 }>;
 
-type KeyChangedType = ReadonlyDeep<{
-  aci: AciString;
-}>;
-
-export type KeyChangeOkType = ReadonlyDeep<{
-  conversationId: string;
+export type HandleCallLinkUpdateType = ReadonlyDeep<{
+  rootKey: string;
+  adminKey: string | null;
 }>;
 
 export type IncomingDirectCallType = ReadonlyDeep<{
@@ -282,7 +292,8 @@ type SendGroupCallReactionLocalCopyType = ReadonlyDeep<{
   timestamp: number;
 }>;
 
-type PeekNotConnectedGroupCallType = ReadonlyDeep<{
+export type PeekNotConnectedGroupCallType = ReadonlyDeep<{
+  callMode: CallMode.Group | CallMode.Adhoc;
   conversationId: string;
 }>;
 
@@ -308,6 +319,10 @@ type RemoteSharingScreenChangeType = ReadonlyDeep<{
   isSharingScreen: boolean;
 }>;
 
+export type RemoveClientType = ReadonlyDeep<{
+  demuxId: number;
+}>;
+
 export type SetLocalAudioType = ReadonlyDeep<{
   enabled: boolean;
 }>;
@@ -330,6 +345,19 @@ export type StartCallingLobbyType = ReadonlyDeep<{
 export type StartCallLinkLobbyType = ReadonlyDeep<{
   rootKey: string;
 }>;
+
+export type StartCallLinkLobbyByRoomIdType = ReadonlyDeep<{
+  roomId: string;
+}>;
+
+type StartCallLinkLobbyThunkActionType = ReadonlyDeep<
+  ThunkAction<
+    void,
+    RootStateType,
+    unknown,
+    StartCallLinkLobbyActionType | ShowErrorModalActionType
+  >
+>;
 
 // eslint-disable-next-line local-rules/type-alias-readonlydeep
 type StartCallingLobbyPayloadType =
@@ -363,6 +391,7 @@ type StartCallLinkLobbyPayloadType = {
   peekInfo?: GroupCallPeekInfoType;
   remoteParticipants: Array<GroupCallParticipantInfoType>;
   callLinkState: CallLinkStateType;
+  callLinkRoomId: string;
   callLinkRootKey: string;
 };
 
@@ -513,7 +542,7 @@ const doGroupCallPeek = ({
         : null;
 
       try {
-        await calling.updateCallHistoryForGroupCall(
+        await calling.updateCallHistoryForGroupCallOnPeek(
           conversationId,
           joinState,
           peekInfo
@@ -544,10 +573,13 @@ const doGroupCallPeek = ({
 // Actions
 
 const ACCEPT_CALL_PENDING = 'calling/ACCEPT_CALL_PENDING';
+const APPROVE_USER = 'calling/APPROVE_USER';
+const BLOCK_CLIENT = 'calling/BLOCK_CLIENT';
 const CANCEL_CALL = 'calling/CANCEL_CALL';
 const CANCEL_INCOMING_GROUP_CALL_RING =
   'calling/CANCEL_INCOMING_GROUP_CALL_RING';
 const CHANGE_CALL_VIEW = 'calling/CHANGE_CALL_VIEW';
+const DENY_USER = 'calling/DENY_USER';
 const START_CALLING_LOBBY = 'calling/START_CALLING_LOBBY';
 const START_CALL_LINK_LOBBY = 'calling/START_CALL_LINK_LOBBY';
 const CALL_STATE_CHANGE_FULFILLED = 'calling/CALL_STATE_CHANGE_FULFILLED';
@@ -560,17 +592,17 @@ const GROUP_CALL_RAISED_HANDS_CHANGE = 'calling/GROUP_CALL_RAISED_HANDS_CHANGE';
 const GROUP_CALL_STATE_CHANGE = 'calling/GROUP_CALL_STATE_CHANGE';
 const GROUP_CALL_REACTIONS_RECEIVED = 'calling/GROUP_CALL_REACTIONS_RECEIVED';
 const GROUP_CALL_REACTIONS_EXPIRED = 'calling/GROUP_CALL_REACTIONS_EXPIRED';
+const HANDLE_CALL_LINK_UPDATE = 'calling/HANDLE_CALL_LINK_UPDATE';
 const HANG_UP = 'calling/HANG_UP';
 const INCOMING_DIRECT_CALL = 'calling/INCOMING_DIRECT_CALL';
 const INCOMING_GROUP_CALL = 'calling/INCOMING_GROUP_CALL';
-const MARK_CALL_TRUSTED = 'calling/MARK_CALL_TRUSTED';
-const MARK_CALL_UNTRUSTED = 'calling/MARK_CALL_UNTRUSTED';
 const OUTGOING_CALL = 'calling/OUTGOING_CALL';
 const PEEK_GROUP_CALL_FULFILLED = 'calling/PEEK_GROUP_CALL_FULFILLED';
 const RAISE_HAND_GROUP_CALL = 'calling/RAISE_HAND_GROUP_CALL';
 const REFRESH_IO_DEVICES = 'calling/REFRESH_IO_DEVICES';
 const REMOTE_SHARING_SCREEN_CHANGE = 'calling/REMOTE_SHARING_SCREEN_CHANGE';
 const REMOTE_VIDEO_CHANGE = 'calling/REMOTE_VIDEO_CHANGE';
+const REMOVE_CLIENT = 'calling/REMOVE_CLIENT';
 const RETURN_TO_ACTIVE_CALL = 'calling/RETURN_TO_ACTIVE_CALL';
 const SEND_GROUP_CALL_REACTION = 'calling/SEND_GROUP_CALL_REACTION';
 const SET_LOCAL_AUDIO_FULFILLED = 'calling/SET_LOCAL_AUDIO_FULFILLED';
@@ -592,6 +624,10 @@ type AcceptCallPendingActionType = ReadonlyDeep<{
   payload: AcceptCallType;
 }>;
 
+type ApproveUserActionType = ReadonlyDeep<{
+  type: 'calling/APPROVE_USER';
+}>;
+
 type CancelCallActionType = ReadonlyDeep<{
   type: 'calling/CANCEL_CALL';
 }>;
@@ -599,6 +635,10 @@ type CancelCallActionType = ReadonlyDeep<{
 type CancelIncomingGroupCallRingActionType = ReadonlyDeep<{
   type: 'calling/CANCEL_INCOMING_GROUP_CALL_RING';
   payload: CancelIncomingGroupCallRingType;
+}>;
+
+type DenyUserActionType = ReadonlyDeep<{
+  type: 'calling/DENY_USER';
 }>;
 
 // eslint-disable-next-line local-rules/type-alias-readonlydeep
@@ -694,6 +734,11 @@ type GroupCallReactionsExpiredActionType = ReadonlyDeep<{
   payload: GroupCallReactionsExpiredActionPayloadType;
 }>;
 
+type HandleCallLinkUpdateActionType = ReadonlyDeep<{
+  type: 'calling/HANDLE_CALL_LINK_UPDATE';
+  payload: HandleCallLinkUpdateActionPayloadType;
+}>;
+
 type HangUpActionType = ReadonlyDeep<{
   type: 'calling/HANG_UP';
   payload: HangUpActionPayloadType;
@@ -707,19 +752,6 @@ type IncomingDirectCallActionType = ReadonlyDeep<{
 type IncomingGroupCallActionType = ReadonlyDeep<{
   type: 'calling/INCOMING_GROUP_CALL';
   payload: IncomingGroupCallType;
-}>;
-
-// eslint-disable-next-line local-rules/type-alias-readonlydeep
-type KeyChangedActionType = {
-  type: 'calling/MARK_CALL_UNTRUSTED';
-  payload: {
-    safetyNumberChangedAcis: Array<AciString>;
-  };
-};
-
-type KeyChangeOkActionType = ReadonlyDeep<{
-  type: 'calling/MARK_CALL_TRUSTED';
-  payload: null;
 }>;
 
 type SendGroupCallRaiseHandActionType = ReadonlyDeep<{
@@ -746,6 +778,15 @@ export type PeekGroupCallFulfilledActionType = ReadonlyDeep<{
   };
 }>;
 
+export type PendingUserActionPayloadType = ReadonlyDeep<{
+  serviceId: ServiceIdString | undefined;
+}>;
+
+export type BatchUserActionPayloadType = ReadonlyDeep<{
+  action: 'approve' | 'deny';
+  serviceIds: Array<ServiceIdString>;
+}>;
+
 // eslint-disable-next-line local-rules/type-alias-readonlydeep
 type RefreshIODevicesActionType = {
   type: 'calling/REFRESH_IO_DEVICES';
@@ -760,6 +801,14 @@ type RemoteSharingScreenChangeActionType = ReadonlyDeep<{
 type RemoteVideoChangeActionType = ReadonlyDeep<{
   type: 'calling/REMOTE_VIDEO_CHANGE';
   payload: RemoteVideoChangeType;
+}>;
+
+type RemoveClientActionType = ReadonlyDeep<{
+  type: 'calling/REMOVE_CLIENT';
+}>;
+
+type BlockClientActionType = ReadonlyDeep<{
+  type: 'calling/BLOCK_CLIENT';
 }>;
 
 type ReturnToActiveCallActionType = ReadonlyDeep<{
@@ -828,10 +877,12 @@ type SwitchFromPresentationViewActionType = ReadonlyDeep<{
 
 // eslint-disable-next-line local-rules/type-alias-readonlydeep
 export type CallingActionType =
+  | ApproveUserActionType
   | AcceptCallPendingActionType
   | CancelCallActionType
   | CancelIncomingGroupCallRingActionType
   | ChangeCallViewActionType
+  | DenyUserActionType
   | StartCallingLobbyActionType
   | StartCallLinkLobbyActionType
   | CallStateChangeFulfilledActionType
@@ -846,16 +897,16 @@ export type CallingActionType =
   | GroupCallStateChangeActionType
   | GroupCallReactionsReceivedActionType
   | GroupCallReactionsExpiredActionType
+  | HandleCallLinkUpdateActionType
   | HangUpActionType
   | IncomingDirectCallActionType
   | IncomingGroupCallActionType
-  | KeyChangedActionType
-  | KeyChangeOkActionType
   | OutgoingCallActionType
   | PeekGroupCallFulfilledActionType
   | RefreshIODevicesActionType
   | RemoteSharingScreenChangeActionType
   | RemoteVideoChangeActionType
+  | RemoveClientActionType
   | ReturnToActiveCallActionType
   | SendGroupCallReactionActionType
   | SetLocalAudioActionType
@@ -886,6 +937,8 @@ function acceptCall(
       return;
     }
 
+    saveDraftRecordingIfNeeded()(dispatch, getState, undefined);
+
     switch (call.callMode) {
       case CallMode.Direct:
         await calling.acceptDirectCall(conversationId, asVideoCall);
@@ -907,6 +960,133 @@ function acceptCall(
   };
 }
 
+function approveUser(
+  payload: PendingUserActionPayloadType
+): ThunkAction<void, RootStateType, unknown, ApproveUserActionType> {
+  return (dispatch, getState) => {
+    const activeCall = getActiveCall(getState().calling);
+    if (!activeCall || !isGroupOrAdhocCallMode(activeCall.callMode)) {
+      log.warn(
+        'approveUser: Trying to approve pending user without active group or adhoc call'
+      );
+      return;
+    }
+    if (!isAciString(payload.serviceId)) {
+      log.warn(
+        'approveUser: Trying to approve pending user without valid aci serviceid'
+      );
+      return;
+    }
+
+    calling.approveUser(activeCall.conversationId, payload.serviceId);
+    dispatch({ type: APPROVE_USER });
+  };
+}
+
+function denyUser(
+  payload: PendingUserActionPayloadType
+): ThunkAction<void, RootStateType, unknown, DenyUserActionType> {
+  return (dispatch, getState) => {
+    const activeCall = getActiveCall(getState().calling);
+    if (!activeCall || !isGroupOrAdhocCallMode(activeCall.callMode)) {
+      log.warn(
+        'approveUser: Trying to approve pending user without active group or adhoc call'
+      );
+      return;
+    }
+    if (!isAciString(payload.serviceId)) {
+      log.warn(
+        'approveUser: Trying to approve pending user without valid aci serviceid'
+      );
+      return;
+    }
+
+    calling.denyUser(activeCall.conversationId, payload.serviceId);
+    dispatch({ type: DENY_USER });
+  };
+}
+
+function batchUserAction(
+  payload: BatchUserActionPayloadType
+): ThunkAction<void, RootStateType, unknown, ShowToastActionType> {
+  return (dispatch, getState) => {
+    const activeCall = getActiveCall(getState().calling);
+    if (!activeCall || !isGroupOrAdhocCallMode(activeCall.callMode)) {
+      log.warn(
+        'batchUserAction: Trying to do pending user without active group or adhoc call'
+      );
+      return;
+    }
+
+    const { action, serviceIds } = payload;
+    let actionFn;
+    if (action === 'approve') {
+      actionFn = calling.approveUser;
+    } else if (action === 'deny') {
+      actionFn = calling.denyUser;
+    } else {
+      throw missingCaseError(action);
+    }
+
+    let count = 0;
+    for (const serviceId of serviceIds) {
+      if (!isAciString(serviceId)) {
+        log.warn(
+          'batchUserAction: Trying to do user action without valid aci serviceid'
+        );
+        continue;
+      }
+
+      actionFn.call(calling, activeCall.conversationId, serviceId);
+      count += 1;
+    }
+
+    if (count > 0 && action === 'approve') {
+      dispatch({
+        type: SHOW_TOAST,
+        payload: {
+          toastType: ToastType.AddedUsersToCall,
+          parameters: { count },
+        },
+      });
+    }
+  };
+}
+
+function removeClient(
+  payload: RemoveClientType
+): ThunkAction<void, RootStateType, unknown, RemoveClientActionType> {
+  return (dispatch, getState) => {
+    const activeCall = getActiveCall(getState().calling);
+    if (!activeCall || !isGroupOrAdhocCallMode(activeCall.callMode)) {
+      log.warn(
+        'removeClient: Trying to remove client without active group or adhoc call'
+      );
+      return;
+    }
+
+    calling.removeClient(activeCall.conversationId, payload.demuxId);
+    dispatch({ type: REMOVE_CLIENT });
+  };
+}
+
+function blockClient(
+  payload: RemoveClientType
+): ThunkAction<void, RootStateType, unknown, BlockClientActionType> {
+  return (dispatch, getState) => {
+    const activeCall = getActiveCall(getState().calling);
+    if (!activeCall || !isGroupOrAdhocCallMode(activeCall.callMode)) {
+      log.warn(
+        'blockClient: Trying to block client without active group or adhoc call'
+      );
+      return;
+    }
+
+    calling.blockClient(activeCall.conversationId, payload.demuxId);
+    dispatch({ type: BLOCK_CLIENT });
+  };
+}
+
 function callStateChange(
   payload: CallStateChangeType
 ): ThunkAction<
@@ -917,10 +1097,6 @@ function callStateChange(
 > {
   return async dispatch => {
     const { callState, acceptedTime, callEndedReason } = payload;
-
-    if (callState === CallState.Ended) {
-      ipcRenderer.send('close-screen-share-controller');
-    }
 
     const wasAccepted = acceptedTime != null;
     const isEnded = callState === CallState.Ended && callEndedReason != null;
@@ -1209,11 +1385,110 @@ function groupCallStateChange(
     if (didSomeoneStartPresenting) {
       void callingTones.someonePresenting();
     }
-
-    if (payload.connectionState === GroupCallConnectionState.NotConnected) {
-      ipcRenderer.send('close-screen-share-controller');
-    }
   };
+}
+
+// From sync messages, to notify us that another device joined or changed a call link.
+function handleCallLinkUpdate(
+  payload: HandleCallLinkUpdateType
+): ThunkAction<void, RootStateType, unknown, HandleCallLinkUpdateActionType> {
+  return async dispatch => {
+    const { rootKey, adminKey } = payload;
+    const callLinkRootKey = CallLinkRootKey.parse(rootKey);
+    const roomId = getRoomIdFromRootKey(callLinkRootKey);
+    const logId = `handleCallLinkUpdate(${roomId})`;
+
+    const readResult = await calling.readCallLink({
+      callLinkRootKey,
+    });
+
+    // Only give up when server confirms the call link is gone. If we fail to fetch
+    // state due to unexpected errors, continue to save rootKey and adminKey.
+    if (readResult.errorStatusCode === 404) {
+      log.info(`${logId}: Call link not found, ignoring`);
+      return;
+    }
+
+    const { callLinkState: freshCallLinkState } = readResult;
+    const existingCallLink = await dataInterface.getCallLinkByRoomId(roomId);
+    const existingCallLinkState = pick(existingCallLink, [
+      'name',
+      'restrictions',
+      'expiration',
+      'revoked',
+    ]);
+
+    const callLink: CallLinkType = {
+      ...CALL_LINK_DEFAULT_STATE,
+      ...existingCallLinkState,
+      ...freshCallLinkState,
+      roomId,
+      rootKey,
+      adminKey,
+    };
+
+    if (existingCallLink) {
+      if (adminKey && adminKey !== existingCallLink.adminKey) {
+        await dataInterface.updateCallLinkAdminKeyByRoomId(roomId, adminKey);
+        log.info(`${logId}: Updated existing call link with new adminKey`);
+      }
+
+      if (freshCallLinkState) {
+        await dataInterface.updateCallLinkState(roomId, freshCallLinkState);
+        log.info(`${logId}: Updated existing call link state`);
+      }
+    } else {
+      await dataInterface.insertCallLink(callLink);
+      log.info(`${logId}: Saved new call link`);
+    }
+
+    dispatch({
+      type: HANDLE_CALL_LINK_UPDATE,
+      payload: { callLink },
+    });
+  };
+}
+
+/**
+ * When starting a lobby and there's an active call, if we're already in call then
+ * focus it (toggle pip), otherwise show an error.
+ * @returns {boolean} `true` if there was an active call and we handled it.
+ */
+function handleActiveCallOnStartLobby({
+  conversationId,
+  state,
+  dispatch,
+}: {
+  conversationId: string;
+  state: RootStateType;
+  dispatch: ThunkDispatch<
+    RootStateType,
+    unknown,
+    ShowErrorModalActionType | TogglePipActionType
+  >;
+}): boolean {
+  const { activeCallState } = state.calling;
+  if (!activeCallState) {
+    return false;
+  }
+
+  if (activeCallState.conversationId === conversationId) {
+    dispatch({
+      type: TOGGLE_PIP,
+    });
+  } else {
+    const i18n = getIntl(state);
+    dispatch({
+      type: SHOW_ERROR_MODAL,
+      payload: {
+        title: i18n('icu:calling__cant-join'),
+        description: i18n('icu:calling__dialog-already-in-call'),
+        buttonVariant: ButtonVariant.Primary,
+      },
+    });
+  }
+
+  return true;
 }
 
 function hangUpActiveCall(
@@ -1248,56 +1523,6 @@ function hangUpActiveCall(
         getState,
       });
     }
-  };
-}
-
-function keyChanged(
-  payload: KeyChangedType
-): ThunkAction<void, RootStateType, unknown, KeyChangedActionType> {
-  return (dispatch, getState) => {
-    const state = getState();
-    const { activeCallState } = state.calling;
-
-    const activeCall = getActiveCall(state.calling);
-    if (!activeCall || !activeCallState) {
-      return;
-    }
-
-    if (isGroupOrAdhocCallState(activeCall)) {
-      const acisChanged = new Set(activeCallState.safetyNumberChangedAcis);
-
-      // Iterate over each participant to ensure that the service id passed in
-      // matches one of the participants in the group call.
-      activeCall.remoteParticipants.forEach(participant => {
-        if (participant.aci === payload.aci) {
-          acisChanged.add(participant.aci);
-        }
-      });
-
-      const safetyNumberChangedAcis = Array.from(acisChanged);
-
-      if (safetyNumberChangedAcis.length) {
-        dispatch({
-          type: MARK_CALL_UNTRUSTED,
-          payload: {
-            safetyNumberChangedAcis,
-          },
-        });
-      }
-    }
-  };
-}
-
-function keyChangeOk(
-  payload: KeyChangeOkType
-): ThunkAction<void, RootStateType, unknown, KeyChangeOkActionType> {
-  return dispatch => {
-    calling.resendGroupCallMediaKeys(payload.conversationId);
-
-    dispatch({
-      type: MARK_CALL_TRUSTED,
-      payload: null,
-    });
   };
 }
 
@@ -1387,6 +1612,21 @@ function outgoingCall(payload: StartDirectCallType): OutgoingCallActionType {
   };
 }
 
+function joinedAdhocCall(
+  roomId: string
+): ThunkAction<void, RootStateType, unknown, never> {
+  return async (_dispatch, getState) => {
+    const state = getState();
+    const callLink = getOwn(state.calling.callLinks, roomId);
+    if (!callLink) {
+      log.warn(`joinedAdhocCall(${roomId}): call link not found`);
+      return;
+    }
+
+    drop(sendCallLinkUpdateSync(callLink));
+  };
+}
+
 function peekGroupCallForTheFirstTime(
   conversationId: string
 ): ThunkAction<void, RootStateType, unknown, PeekGroupCallFulfilledActionType> {
@@ -1436,10 +1676,10 @@ function peekNotConnectedGroupCall(
   payload: PeekNotConnectedGroupCallType
 ): ThunkAction<void, RootStateType, unknown, PeekGroupCallFulfilledActionType> {
   return (dispatch, getState) => {
-    const { conversationId } = payload;
+    const { callMode, conversationId } = payload;
     doGroupCallPeek({
       conversationId,
-      callMode: CallMode.Group,
+      callMode,
       dispatch,
       getState,
     });
@@ -1717,85 +1957,223 @@ function onOutgoingAudioCallInConversation(
   };
 }
 
-function startCallLinkLobby({
-  rootKey,
-}: StartCallLinkLobbyType): ThunkAction<
+function createCallLink(
+  onCreated: (roomId: string) => void
+): ThunkAction<
   void,
   RootStateType,
   unknown,
-  StartCallLinkLobbyActionType | ShowErrorModalActionType
+  CallHistoryAdd | HandleCallLinkUpdateActionType
 > {
-  return async (dispatch, getState) => {
-    const state = getState();
+  return async dispatch => {
+    strictAssert(isCallLinksCreateEnabled(), 'Call links creation is disabled');
 
-    if (state.calling.activeCallState) {
-      const i18n = getIntl(getState());
-      dispatch({
-        type: SHOW_ERROR_MODAL,
-        payload: {
-          title: i18n('icu:calling__cant-join'),
-          description: i18n('icu:calling__dialog-already-in-call'),
-          buttonVariant: ButtonVariant.Primary,
-        },
-      });
-      return;
-    }
-
-    const callLinkRootKey = CallLinkRootKey.parse(rootKey);
-
-    const callLinkState = await calling.readCallLink({ callLinkRootKey });
-    if (!callLinkState) {
-      const i18n = getIntl(getState());
-      dispatch({
-        type: SHOW_ERROR_MODAL,
-        payload: {
-          title: i18n('icu:calling__cant-join'),
-          description: i18n('icu:calling__call-link-connection-issues'),
-          buttonVariant: ButtonVariant.Primary,
-        },
-      });
-      return;
-    }
-    if (callLinkState.revoked || callLinkState.expiration < new Date()) {
-      const i18n = getIntl(getState());
-      dispatch({
-        type: SHOW_ERROR_MODAL,
-        payload: {
-          title: i18n('icu:calling__cant-join'),
-          description: i18n('icu:calling__call-link-no-longer-valid'),
-          buttonVariant: ButtonVariant.Primary,
-        },
-      });
-      return;
-    }
-
-    const roomId = getRoomIdFromRootKey(callLinkRootKey);
-    const groupCall = getGroupCall(roomId, state.calling, CallMode.Adhoc);
-    const groupCallDeviceCount =
-      groupCall?.peekInfo?.deviceCount ||
-      groupCall?.remoteParticipants.length ||
-      0;
-
-    const callLobbyData = await calling.startCallLinkLobby({
-      callLinkRootKey,
-      hasLocalAudio: groupCallDeviceCount < 8,
-    });
-    if (!callLobbyData) {
-      return;
-    }
-
+    const callLink = await calling.createCallLink();
+    const callHistory: CallHistoryDetails = {
+      callId: generateUuid(),
+      peerId: callLink.roomId,
+      ringerId: null,
+      mode: CallMode.Adhoc,
+      type: CallType.Adhoc,
+      direction: CallDirection.Incoming,
+      timestamp: Date.now(),
+      status: AdhocCallStatus.Pending,
+    };
+    await Promise.all([
+      dataInterface.insertCallLink(callLink),
+      dataInterface.saveCallHistory(callHistory),
+    ]);
     dispatch({
-      type: START_CALL_LINK_LOBBY,
-      payload: {
-        ...callLobbyData,
-        callLinkState: calling.formatCallLinkStateForRedux(callLinkState),
-        callLinkRootKey: rootKey,
-        conversationId: roomId,
-        isConversationTooBigToRing: false,
-      },
+      type: HANDLE_CALL_LINK_UPDATE,
+      payload: { callLink },
+    });
+    dispatch(addCallHistory(callHistory));
+    // Call after dispatching the action to ensure the call link is in the store
+    onCreated(callLink.roomId);
+  };
+}
+
+function updateCallLinkName(
+  roomId: string,
+  name: string
+): ThunkAction<void, RootStateType, unknown, HandleCallLinkUpdateActionType> {
+  return async dispatch => {
+    const prevCallLink = await dataInterface.getCallLinkByRoomId(roomId);
+    strictAssert(
+      prevCallLink,
+      `updateCallLinkName(${roomId}): call link not found`
+    );
+    const callLinkState = await calling.updateCallLinkName(prevCallLink, name);
+    const callLink = await dataInterface.updateCallLinkState(
+      roomId,
+      callLinkState
+    );
+    dispatch({
+      type: HANDLE_CALL_LINK_UPDATE,
+      payload: { callLink },
     });
   };
 }
+
+function updateCallLinkRestrictions(
+  roomId: string,
+  restrictions: CallLinkRestrictions
+): ThunkAction<void, RootStateType, unknown, HandleCallLinkUpdateActionType> {
+  return async dispatch => {
+    const prevCallLink = await dataInterface.getCallLinkByRoomId(roomId);
+    strictAssert(
+      prevCallLink,
+      `updateCallLinkRestrictions(${roomId}): call link not found`
+    );
+    const callLinkState = await calling.updateCallLinkRestrictions(
+      prevCallLink,
+      restrictions
+    );
+    const callLink = await dataInterface.updateCallLinkState(
+      roomId,
+      callLinkState
+    );
+    dispatch({
+      type: HANDLE_CALL_LINK_UPDATE,
+      payload: { callLink },
+    });
+  };
+}
+
+function startCallLinkLobbyByRoomId(
+  roomId: string
+): StartCallLinkLobbyThunkActionType {
+  return async (dispatch, getState) => {
+    const state = getState();
+    const callLink = getOwn(state.calling.callLinks, roomId);
+
+    strictAssert(
+      callLink,
+      `startCallLinkLobbyByRoomId(${roomId}): call link not found`
+    );
+
+    const { rootKey } = callLink;
+    await _startCallLinkLobby({ rootKey, dispatch, getState });
+  };
+}
+
+function startCallLinkLobby({
+  rootKey,
+}: StartCallLinkLobbyType): StartCallLinkLobbyThunkActionType {
+  return async (dispatch, getState) => {
+    await _startCallLinkLobby({ rootKey, dispatch, getState });
+  };
+}
+
+const _startCallLinkLobby = async ({
+  rootKey,
+  dispatch,
+  getState,
+}: {
+  rootKey: string;
+  dispatch: ThunkDispatch<
+    RootStateType,
+    unknown,
+    | StartCallLinkLobbyActionType
+    | ShowErrorModalActionType
+    | TogglePipActionType
+  >;
+  getState: () => RootStateType;
+}) => {
+  const callLinkRootKey = CallLinkRootKey.parse(rootKey);
+  const roomId = getRoomIdFromRootKey(callLinkRootKey);
+  const state = getState();
+
+  if (
+    handleActiveCallOnStartLobby({ conversationId: roomId, state, dispatch })
+  ) {
+    return;
+  }
+
+  const readResult = await calling.readCallLink({ callLinkRootKey });
+  const { callLinkState } = readResult;
+  if (!callLinkState) {
+    const i18n = getIntl(getState());
+    dispatch({
+      type: SHOW_ERROR_MODAL,
+      payload: {
+        title: i18n('icu:calling__cant-join'),
+        description: i18n('icu:calling__call-link-connection-issues'),
+        buttonVariant: ButtonVariant.Primary,
+      },
+    });
+    return;
+  }
+  if (
+    callLinkState.revoked ||
+    callLinkState.expiration < new Date().getTime()
+  ) {
+    const i18n = getIntl(getState());
+    dispatch({
+      type: SHOW_ERROR_MODAL,
+      payload: {
+        title: i18n('icu:calling__cant-join'),
+        description: i18n('icu:calling__call-link-no-longer-valid'),
+        buttonVariant: ButtonVariant.Primary,
+      },
+    });
+    return;
+  }
+
+  try {
+    const callLinkExists = await dataInterface.callLinkExists(roomId);
+    if (callLinkExists) {
+      await dataInterface.updateCallLinkState(roomId, callLinkState);
+      log.info('startCallLinkLobby: Updated existing call link', roomId);
+    } else {
+      const { name, restrictions, expiration, revoked } = callLinkState;
+      await dataInterface.insertCallLink({
+        roomId,
+        rootKey,
+        adminKey: null,
+        name,
+        restrictions,
+        revoked,
+        expiration,
+      });
+      log.info('startCallLinkLobby: Saved new call link', roomId);
+    }
+  } catch (err) {
+    log.error(
+      'startCallLinkLobby: Call link DB error',
+      Errors.toLogFormat(err)
+    );
+  }
+
+  const groupCall = getGroupCall(roomId, state.calling, CallMode.Adhoc);
+  const groupCallDeviceCount =
+    groupCall?.peekInfo?.deviceCount ||
+    groupCall?.remoteParticipants.length ||
+    0;
+
+  const { adminKey } = getOwn(state.calling.callLinks, roomId) ?? {};
+  const adminPasskey = adminKey ? toAdminKeyBytes(adminKey) : undefined;
+  const callLobbyData = await calling.startCallLinkLobby({
+    callLinkRootKey,
+    adminPasskey,
+    hasLocalAudio: groupCallDeviceCount < 8,
+  });
+  if (!callLobbyData) {
+    return;
+  }
+
+  dispatch({
+    type: START_CALL_LINK_LOBBY,
+    payload: {
+      ...callLobbyData,
+      callLinkState,
+      callLinkRoomId: roomId,
+      callLinkRootKey: rootKey,
+      conversationId: roomId,
+      isConversationTooBigToRing: false,
+    },
+  });
+};
 
 function startCallingLobby({
   conversationId,
@@ -1804,7 +2182,7 @@ function startCallingLobby({
   void,
   RootStateType,
   unknown,
-  StartCallingLobbyActionType
+  StartCallingLobbyActionType | TogglePipActionType
 > {
   return async (dispatch, getState) => {
     const state = getState();
@@ -1911,6 +2289,7 @@ function startCall(
         await calling.joinCallLinkCall({
           roomId: conversationId,
           rootKey: callLink.rootKey,
+          adminKey: callLink.adminKey ?? undefined,
           hasLocalAudio,
           hasLocalVideo,
         });
@@ -1969,21 +2348,26 @@ function switchFromPresentationView(): SwitchFromPresentationViewActionType {
 }
 export const actions = {
   acceptCall,
+  approveUser,
+  batchUserAction,
+  blockClient,
   callStateChange,
   cancelCall,
   cancelIncomingGroupCallRing,
   changeCallView,
   changeIODevice,
   closeNeedPermissionScreen,
+  createCallLink,
   declineCall,
+  denyUser,
   getPresentingSources,
   groupCallAudioLevelsChange,
   groupCallEnded,
   groupCallRaisedHandsChange,
   groupCallStateChange,
   hangUpActiveCall,
-  keyChangeOk,
-  keyChanged,
+  handleCallLinkUpdate,
+  joinedAdhocCall,
   onOutgoingVideoCallInConversation,
   onOutgoingAudioCallInConversation,
   openSystemPreferencesAction,
@@ -1997,6 +2381,7 @@ export const actions = {
   refreshIODevices,
   remoteSharingScreenChange,
   remoteVideoChange,
+  removeClient,
   returnToActiveCall,
   sendGroupCallRaiseHand,
   sendGroupCallReaction,
@@ -2010,6 +2395,7 @@ export const actions = {
   setRendererCanvas,
   startCall,
   startCallLinkLobby,
+  startCallLinkLobbyByRoomId,
   startCallingLobby,
   switchToPresentationView,
   switchFromPresentationView,
@@ -2017,6 +2403,8 @@ export const actions = {
   togglePip,
   toggleScreenRecordingPermissionsDialog,
   toggleSettings,
+  updateCallLinkName,
+  updateCallLinkRestrictions,
 };
 
 export const useCallingActions = (): BoundActionCreatorsMapObject<
@@ -2144,6 +2532,7 @@ export function reducer(
           peekInfo: peekInfo ||
             existingCall?.peekInfo || {
               acis: remoteParticipants.map(({ aci }) => aci),
+              pendingAcis: [],
               maxDevices: Infinity,
               deviceCount: remoteParticipants.length,
             },
@@ -2193,7 +2582,13 @@ export function reducer(
               ...callLinks,
               [conversationId]: {
                 ...action.payload.callLinkState,
-                rootKey: action.payload.callLinkRootKey,
+                roomId:
+                  callLinks[conversationId]?.roomId ??
+                  action.payload.callLinkRoomId,
+                rootKey:
+                  callLinks[conversationId]?.rootKey ??
+                  action.payload.callLinkRootKey,
+                adminKey: callLinks[conversationId]?.adminKey,
               },
             }
           : callLinks,
@@ -2205,7 +2600,6 @@ export function reducer(
         localAudioLevel: 0,
         viewMode: CallViewMode.Paginated,
         pip: false,
-        safetyNumberChangedAcis: [],
         settingsDialogOpen: false,
         showParticipantsList: false,
         outgoingRing,
@@ -2235,7 +2629,6 @@ export function reducer(
         localAudioLevel: 0,
         viewMode: CallViewMode.Paginated,
         pip: false,
-        safetyNumberChangedAcis: [],
         settingsDialogOpen: false,
         showParticipantsList: false,
         outgoingRing: true,
@@ -2264,7 +2657,6 @@ export function reducer(
         localAudioLevel: 0,
         viewMode: CallViewMode.Paginated,
         pip: false,
-        safetyNumberChangedAcis: [],
         settingsDialogOpen: false,
         showParticipantsList: false,
         outgoingRing: false,
@@ -2287,18 +2679,8 @@ export function reducer(
       case CallMode.Direct:
         return removeConversationFromState(state, activeCall.conversationId);
       case CallMode.Group:
+      case CallMode.Adhoc:
         return omit(state, 'activeCallState');
-      case CallMode.Adhoc: {
-        // TODO: When call links persist in the DB, we can remove the removal logic here.
-        log.info(
-          `Removing active adhoc call with roomId ${activeCall.conversationId}`
-        );
-        const { callLinks } = state;
-        return {
-          ...omit(state, 'activeCallState'),
-          callLinks: omit(callLinks, activeCall.conversationId),
-        };
-      }
       default:
         throw missingCaseError(activeCall);
     }
@@ -2397,6 +2779,7 @@ export function reducer(
         localDemuxId: undefined,
         peekInfo: {
           acis: [],
+          pendingAcis: [],
           maxDevices: Infinity,
           deviceCount: 0,
         },
@@ -2436,7 +2819,6 @@ export function reducer(
         localAudioLevel: 0,
         viewMode: CallViewMode.Paginated,
         pip: false,
-        safetyNumberChangedAcis: [],
         settingsDialogOpen: false,
         showParticipantsList: false,
         outgoingRing: true,
@@ -2446,6 +2828,25 @@ export function reducer(
   }
 
   if (action.type === CALL_STATE_CHANGE_FULFILLED) {
+    const call = getOwn(
+      state.callsByConversation,
+      action.payload.conversationId
+    );
+
+    if (
+      call?.callMode === CallMode.Direct &&
+      call?.callState !== action.payload.callState
+    ) {
+      drop(
+        calling.notifyScreenShareStatus({
+          callMode: CallMode.Direct,
+          callState: action.payload.callState,
+          isPresenting: state.activeCallState?.presentingSource != null,
+          conversationId: state.activeCallState?.conversationId,
+        })
+      );
+    }
+
     // We want to keep the state around for ended calls if they resulted in a message
     //   request so we can show the "needs permission" screen.
     if (
@@ -2456,10 +2857,6 @@ export function reducer(
       return removeConversationFromState(state, action.payload.conversationId);
     }
 
-    const call = getOwn(
-      state.callsByConversation,
-      action.payload.conversationId
-    );
     if (call?.callMode !== CallMode.Direct) {
       log.warn('Cannot update state for a non-direct call');
       return state;
@@ -2596,6 +2993,7 @@ export function reducer(
     const newPeekInfo = peekInfo ||
       existingCall?.peekInfo || {
         acis: remoteParticipants.map(({ aci }) => aci),
+        pendingAcis: [],
         maxDevices: Infinity,
         deviceCount: remoteParticipants.length,
       };
@@ -2645,6 +3043,17 @@ export function reducer(
       ...newRingState,
     };
 
+    if (existingCall?.connectionState !== connectionState) {
+      drop(
+        calling.notifyScreenShareStatus({
+          callMode,
+          connectionState,
+          isPresenting: state.activeCallState?.presentingSource != null,
+          conversationId: state.activeCallState?.conversationId,
+        })
+      );
+    }
+
     return {
       ...state,
       ...mergeCallWithGroupCallLookups({
@@ -2675,6 +3084,7 @@ export function reducer(
       localDemuxId: undefined,
       peekInfo: {
         acis: [],
+        pendingAcis: [],
         maxDevices: Infinity,
         deviceCount: 0,
       },
@@ -3113,39 +3523,16 @@ export function reducer(
     };
   }
 
-  if (action.type === MARK_CALL_UNTRUSTED) {
-    const { activeCallState } = state;
-    if (!activeCallState) {
-      log.warn('Cannot mark call as untrusted when there is no active call');
-      return state;
-    }
-
-    const { safetyNumberChangedAcis } = action.payload;
+  if (action.type === HANDLE_CALL_LINK_UPDATE) {
+    const { callLinks } = state;
+    const { callLink } = action.payload;
+    const { roomId } = callLink;
 
     return {
       ...state,
-      activeCallState: {
-        ...activeCallState,
-        pip: false,
-        safetyNumberChangedAcis,
-        settingsDialogOpen: false,
-        showParticipantsList: false,
-      },
-    };
-  }
-
-  if (action.type === MARK_CALL_TRUSTED) {
-    const { activeCallState } = state;
-    if (!activeCallState) {
-      log.warn('Cannot mark call as trusted when there is no active call');
-      return state;
-    }
-
-    return {
-      ...state,
-      activeCallState: {
-        ...activeCallState,
-        safetyNumberChangedAcis: [],
+      callLinks: {
+        ...callLinks,
+        [roomId]: callLink,
       },
     };
   }

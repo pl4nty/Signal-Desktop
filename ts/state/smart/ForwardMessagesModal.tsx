@@ -3,21 +3,15 @@
 
 import React, { useCallback, useState } from 'react';
 import { useSelector } from 'react-redux';
-import type {
-  ForwardMessagePropsType,
-  ForwardMessagesPropsType,
-} from '../ducks/globalModals';
+import type { ForwardMessagesPropsType } from '../ducks/globalModals';
 import * as log from '../../logging/log';
 import { ForwardMessagesModal } from '../../components/ForwardMessagesModal';
 import { LinkPreviewSourceType } from '../../types/LinkPreview';
 import * as Errors from '../../types/errors';
-import type { GetConversationByIdType } from '../selectors/conversations';
-import {
-  getAllComposableConversations,
-  getConversationSelector,
-} from '../selectors/conversations';
+import { getAllComposableConversations } from '../selectors/conversations';
 import { getIntl, getTheme, getRegionCode } from '../selectors/user';
 import { getLinkPreview } from '../selectors/linkPreviews';
+import { isInFullScreenCall as getIsInFullScreenCall } from '../selectors/calling';
 import { getPreferredBadgeSelector } from '../selectors/badges';
 import { maybeForwardMessages } from '../../util/maybeForwardMessages';
 import {
@@ -28,7 +22,6 @@ import { useGlobalModalActions } from '../ducks/globalModals';
 import { useLinkPreviewActions } from '../ducks/linkPreviews';
 import { SmartCompositionTextArea } from './CompositionTextArea';
 import { useToastActions } from '../ducks/toast';
-import { hydrateRanges } from '../../types/BodyRange';
 import { isDownloaded } from '../../types/Attachment';
 import { __DEPRECATED$getMessageById } from '../../messages/getMessageById';
 import { strictAssert } from '../../util/assert';
@@ -38,21 +31,6 @@ import type {
 } from '../../types/ForwardDraft';
 import { getForwardMessagesProps } from '../selectors/globalModals';
 
-function toMessageForwardDraft(
-  props: ForwardMessagePropsType,
-  getConversation: GetConversationByIdType
-): MessageForwardDraft {
-  return {
-    attachments: props.attachments ?? [],
-    bodyRanges: hydrateRanges(props.bodyRanges, getConversation),
-    hasContact: Boolean(props.contact),
-    isSticker: Boolean(props.isSticker),
-    messageBody: props.text,
-    originalMessageId: props.id,
-    previews: props.previews ?? [],
-  };
-}
-
 export function SmartForwardMessagesModal(): JSX.Element | null {
   const forwardMessagesProps = useSelector(getForwardMessagesProps);
 
@@ -61,8 +39,8 @@ export function SmartForwardMessagesModal(): JSX.Element | null {
   }
 
   if (
-    !forwardMessagesProps.messages.every(message => {
-      return message.attachments?.every(isDownloaded) ?? true;
+    !forwardMessagesProps.messageDrafts.every(messageDraft => {
+      return messageDraft.attachments?.every(isDownloaded) ?? true;
     })
   ) {
     return null;
@@ -80,13 +58,15 @@ function SmartForwardMessagesModalInner({
 }: {
   forwardMessagesProps: ForwardMessagesPropsType;
 }): JSX.Element | null {
+  const { type } = forwardMessagesProps;
+
   const candidateConversations = useSelector(getAllComposableConversations);
   const getPreferredBadge = useSelector(getPreferredBadgeSelector);
-  const getConversation = useSelector(getConversationSelector);
   const i18n = useSelector(getIntl);
   const linkPreviewForSource = useSelector(getLinkPreview);
   const regionCode = useSelector(getRegionCode);
   const theme = useSelector(getTheme);
+  const isInFullScreenCall = useSelector(getIsInFullScreenCall);
 
   const { removeLinkPreview } = useLinkPreviewActions();
   const { toggleForwardMessagesModal } = useGlobalModalActions();
@@ -94,9 +74,7 @@ function SmartForwardMessagesModalInner({
 
   const [drafts, setDrafts] = useState<ReadonlyArray<MessageForwardDraft>>(
     () => {
-      return forwardMessagesProps.messages.map((props): MessageForwardDraft => {
-        return toMessageForwardDraft(props, getConversation);
-      });
+      return forwardMessagesProps.messageDrafts;
     }
   );
 
@@ -125,7 +103,7 @@ function SmartForwardMessagesModalInner({
 
   const closeModal = useCallback(() => {
     resetLinkPreview();
-    toggleForwardMessagesModal();
+    toggleForwardMessagesModal(null);
   }, [toggleForwardMessagesModal]);
 
   const doForwardMessages = useCallback(
@@ -136,6 +114,9 @@ function SmartForwardMessagesModalInner({
       try {
         const messages = await Promise.all(
           finalDrafts.map(async (draft): Promise<ForwardMessageData> => {
+            if (draft.originalMessageId == null) {
+              return { draft, originalMessage: null };
+            }
             const message = await __DEPRECATED$getMessageById(
               draft.originalMessageId
             );
@@ -175,11 +156,13 @@ function SmartForwardMessagesModalInner({
       linkPreviewForSource={linkPreviewForSource}
       getPreferredBadge={getPreferredBadge}
       i18n={i18n}
+      isInFullScreenCall={isInFullScreenCall}
       onClose={closeModal}
       onChange={handleChange}
       regionCode={regionCode}
       RenderCompositionTextArea={SmartCompositionTextArea}
       removeLinkPreview={removeLinkPreview}
+      type={type}
       showToast={showToast}
       theme={theme}
     />

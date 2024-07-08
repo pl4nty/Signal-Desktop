@@ -2,29 +2,37 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import Long from 'long';
-import { Aci, Pni } from '@signalapp/libsignal-client';
+import { Aci, Pni, ServiceId } from '@signalapp/libsignal-client';
+import type { BackupLevel } from '@signalapp/libsignal-client/zkgroup';
 import pMap from 'p-map';
 import pTimeout from 'p-timeout';
 import { Readable } from 'stream';
 
-import { Backups } from '../../protobuf';
+import { Backups, SignalService } from '../../protobuf';
 import Data from '../../sql/Client';
 import type { PageMessagesCursorType } from '../../sql/Interface';
 import * as log from '../../logging/log';
+import { GiftBadgeStates } from '../../components/conversation/Message';
 import { StorySendMode, MY_STORY_ID } from '../../types/Stories';
-import type { ServiceIdString } from '../../types/ServiceId';
+import {
+  isPniString,
+  type AciString,
+  type ServiceIdString,
+} from '../../types/ServiceId';
 import type { RawBodyRange } from '../../types/BodyRange';
 import { LONG_ATTACHMENT_LIMIT } from '../../types/Message';
+import { PaymentEventKind } from '../../types/Payment';
 import type {
   ConversationAttributesType,
   MessageAttributesType,
-  QuotedAttachment,
+  QuotedAttachmentType,
   QuotedMessageType,
 } from '../../model-types.d';
 import { drop } from '../../util/drop';
 import { explodePromise } from '../../util/explodePromise';
 import {
   isDirectConversation,
+  isGroup,
   isGroupV2,
   isMe,
 } from '../../util/whatTypeOfConversation';
@@ -42,11 +50,59 @@ import {
   parsePhoneNumberSharingMode,
 } from '../../util/phoneNumberSharingMode';
 import { missingCaseError } from '../../util/missingCaseError';
-import { isNormalBubble } from '../../state/selectors/message';
+import {
+  isCallHistory,
+  isChatSessionRefreshed,
+  isContactRemovedNotification,
+  isConversationMerge,
+  isDeliveryIssue,
+  isEndSession,
+  isExpirationTimerUpdate,
+  isGiftBadge,
+  isGroupUpdate,
+  isGroupV1Migration,
+  isGroupV2Change,
+  isKeyChange,
+  isNormalBubble,
+  isPhoneNumberDiscovery,
+  isProfileChange,
+  isUniversalTimerNotification,
+  isUnsupportedMessage,
+  isVerifiedChange,
+  isChangeNumberNotification,
+  isJoinedSignalNotification,
+  isTitleTransitionNotification,
+} from '../../state/selectors/message';
 import * as Bytes from '../../Bytes';
 import { canBeSynced as canPreferredReactionEmojiBeSynced } from '../../reactions/preferredReactionEmoji';
 import { SendStatus } from '../../messages/MessageSendState';
+import { deriveGroupFields } from '../../groups';
 import { BACKUP_VERSION } from './constants';
+import { getMessageIdForLogging } from '../../util/idForLogging';
+import { getCallsHistoryForRedux } from '../callHistoryLoader';
+import { makeLookup } from '../../util/makeLookup';
+import type { CallHistoryDetails } from '../../types/CallDisposition';
+import { isAciString } from '../../util/isAciString';
+import type { AboutMe } from './types';
+import { messageHasPaymentEvent } from '../../messages/helpers';
+import {
+  numberToAddressType,
+  numberToPhoneType,
+} from '../../types/EmbeddedContact';
+import {
+  type AttachmentType,
+  isGIF,
+  isDownloaded,
+  isVoiceMessage as isVoiceMessageAttachment,
+} from '../../types/Attachment';
+import {
+  getFilePointerForAttachment,
+  maybeGetBackupJobForAttachmentAndFilePointer,
+} from './util/filePointers';
+import type { CoreAttachmentBackupJobType } from '../../types/AttachmentBackup';
+import { AttachmentBackupManager } from '../../jobs/AttachmentBackupManager';
+import { getBackupCdnInfo } from './util/mediaId';
+import { ReadStatus } from '../../messages/MessageReadStatus';
 
 const MAX_CONCURRENCY = 10;
 
@@ -56,6 +112,8 @@ const FLUSH_TIMEOUT = 30 * MINUTE;
 
 // Threshold for reporting slow flushes
 const REPORTING_THRESHOLD = SECOND;
+
+const ZERO_PROFILE_KEY = new Uint8Array(32);
 
 type GetRecipientIdOptionsType =
   | Readonly<{
@@ -74,35 +132,75 @@ type GetRecipientIdOptionsType =
       e164: string;
     }>;
 
+type ToChatItemOptionsType = Readonly<{
+  aboutMe: AboutMe;
+  callHistoryByCallId: Record<string, CallHistoryDetails>;
+  backupLevel: BackupLevel;
+}>;
+
+type NonBubbleOptionsType = Pick<
+  ToChatItemOptionsType,
+  'aboutMe' | 'callHistoryByCallId'
+> &
+  Readonly<{
+    authorId: Long | undefined;
+    message: MessageAttributesType;
+  }>;
+
+enum NonBubbleResultKind {
+  Directed = 'Directed',
+  Directionless = 'Directionless',
+  Drop = 'Drop',
+}
+
+type NonBubbleResultType = Readonly<
+  | {
+      kind: NonBubbleResultKind.Drop;
+      patch?: undefined;
+    }
+  | {
+      kind: NonBubbleResultKind.Directed | NonBubbleResultKind.Directionless;
+      patch: Backups.IChatItem;
+    }
+>;
+
 export class BackupExportStream extends Readable {
+  private readonly backupTimeMs = getSafeLongFromTimestamp(Date.now());
   private readonly convoIdToRecipientId = new Map<string, number>();
+  private attachmentBackupJobs: Array<CoreAttachmentBackupJobType> = [];
   private buffers = new Array<Uint8Array>();
   private nextRecipientId = 0;
   private flushResolve: (() => void) | undefined;
 
-  public run(): void {
+  public run(backupLevel: BackupLevel): void {
     drop(
       (async () => {
         log.info('BackupExportStream: starting...');
-        await Data.pauseWriteAccess();
 
+        await Data.pauseWriteAccess();
         try {
-          await this.unsafeRun();
+          await this.unsafeRun(backupLevel);
         } catch (error) {
           this.emit('error', error);
         } finally {
           await Data.resumeWriteAccess();
+          await Promise.all(
+            this.attachmentBackupJobs.map(job =>
+              AttachmentBackupManager.addJob(job)
+            )
+          );
+          drop(AttachmentBackupManager.start());
           log.info('BackupExportStream: finished');
         }
       })()
     );
   }
 
-  private async unsafeRun(): Promise<void> {
+  private async unsafeRun(backupLevel: BackupLevel): Promise<void> {
     this.push(
       Backups.BackupInfo.encodeDelimited({
         version: Long.fromNumber(BACKUP_VERSION),
-        backupTimeMs: getSafeLongFromTimestamp(Date.now()),
+        backupTimeMs: this.backupTimeMs,
       }).finish()
     );
 
@@ -117,6 +215,7 @@ export class BackupExportStream extends Readable {
       distributionLists: 0,
       messages: 0,
       skippedMessages: 0,
+      stickerPacks: 0,
     };
 
     for (const { attributes } of window.ConversationController.getAll()) {
@@ -165,16 +264,21 @@ export class BackupExportStream extends Readable {
         recipient: {
           id: this.getDistributionListRecipientId(),
           distributionList: {
-            name: list.name,
             distributionId: uuidToBytes(list.id),
-            allowReplies: list.allowsReplies,
             deletionTimestamp: list.deletedAtTimestamp
               ? Long.fromNumber(list.deletedAtTimestamp)
               : null,
-            privacyMode,
-            memberRecipientIds: list.members.map(serviceId =>
-              this.getOrPushPrivateRecipient({ serviceId })
-            ),
+
+            distributionList: list.deletedAtTimestamp
+              ? null
+              : {
+                  name: list.name,
+                  allowReplies: list.allowsReplies,
+                  privacyMode,
+                  memberRecipientIds: list.members.map(serviceId =>
+                    this.getOrPushPrivateRecipient({ serviceId })
+                  ),
+                },
           },
         },
       });
@@ -184,8 +288,31 @@ export class BackupExportStream extends Readable {
       stats.distributionLists += 1;
     }
 
+    const stickerPacks = await Data.getInstalledStickerPacks();
+
+    for (const { id, key } of stickerPacks) {
+      this.pushFrame({
+        stickerPack: {
+          packId: Bytes.fromHex(id),
+          packKey: Bytes.fromBase64(key),
+        },
+      });
+
+      // eslint-disable-next-line no-await-in-loop
+      await this.flush();
+      stats.stickerPacks += 1;
+    }
+
+    const pinnedConversationIds =
+      window.storage.get('pinnedConversationIds') || [];
+
     for (const { attributes } of window.ConversationController.getAll()) {
       const recipientId = this.getRecipientId(attributes);
+
+      let pinnedOrder: number | null = null;
+      if (attributes.isPinned) {
+        pinnedOrder = Math.max(0, pinnedConversationIds.indexOf(attributes.id));
+      }
 
       this.pushFrame({
         chat: {
@@ -194,7 +321,7 @@ export class BackupExportStream extends Readable {
           recipientId,
 
           archived: attributes.isArchived === true,
-          pinnedOrder: attributes.isPinned === true ? 1 : null,
+          pinnedOrder,
           expirationTimerMs:
             attributes.expireTimer != null
               ? Long.fromNumber(
@@ -215,6 +342,18 @@ export class BackupExportStream extends Readable {
 
     let cursor: PageMessagesCursorType | undefined;
 
+    const callHistory = getCallsHistoryForRedux();
+    const callHistoryByCallId = makeLookup(callHistory, 'callId');
+
+    const me = window.ConversationController.getOurConversationOrThrow();
+    const serviceId = me.get('serviceId');
+    const aci = isAciString(serviceId) ? serviceId : undefined;
+    strictAssert(aci, 'We must have our own ACI');
+    const aboutMe = {
+      aci,
+      pni: me.get('pni'),
+    };
+
     try {
       while (!cursor?.done) {
         // eslint-disable-next-line no-await-in-loop
@@ -223,7 +362,12 @@ export class BackupExportStream extends Readable {
         // eslint-disable-next-line no-await-in-loop
         const items = await pMap(
           messages,
-          message => this.toChatItem(message),
+          message =>
+            this.toChatItem(message, {
+              aboutMe,
+              callHistoryByCallId,
+              backupLevel,
+            }),
           { concurrency: MAX_CONCURRENCY }
         );
 
@@ -252,7 +396,11 @@ export class BackupExportStream extends Readable {
     }
 
     await this.flush();
-    log.warn('backups: final stats', stats);
+
+    log.warn('backups: final stats', {
+      ...stats,
+      attachmentBackupJobs: this.attachmentBackupJobs.length,
+    });
 
     this.push(null);
   }
@@ -327,20 +475,45 @@ export class BackupExportStream extends Readable {
         throw missingCaseError(rawPhoneNumberSharingMode);
     }
 
+    const usernameLink = storage.get('usernameLink');
+
+    const subscriberId = storage.get('subscriberId');
+    const backupsSubscriberId = storage.get('backupsSubscriberId');
+
     return {
       profileKey: storage.get('profileKey'),
-      username: me.get('username'),
-      usernameLink: {
-        ...(storage.get('usernameLink') ?? {}),
+      username: me.get('username') || null,
+      usernameLink: usernameLink
+        ? {
+            ...usernameLink,
 
-        // Same numeric value, no conversion needed
-        color: storage.get('usernameLinkColor'),
-      },
+            // Same numeric value, no conversion needed
+            color: storage.get('usernameLinkColor'),
+          }
+        : null,
       givenName: me.get('profileName'),
       familyName: me.get('profileFamilyName'),
       avatarUrlPath: storage.get('avatarUrl'),
-      subscriberId: storage.get('subscriberId'),
-      subscriberCurrencyCode: storage.get('subscriberCurrencyCode'),
+      backupsSubscriberData: Bytes.isNotEmpty(backupsSubscriberId)
+        ? {
+            subscriberId: backupsSubscriberId,
+            currencyCode: storage.get('backupsSubscriberCurrencyCode'),
+            manuallyCancelled: storage.get(
+              'backupsSubscriptionManuallyCancelled',
+              false
+            ),
+          }
+        : null,
+      donationSubscriberData: Bytes.isNotEmpty(subscriberId)
+        ? {
+            subscriberId,
+            currencyCode: storage.get('subscriberCurrencyCode'),
+            manuallyCancelled: storage.get(
+              'donorSubscriptionManuallyCancelled',
+              false
+            ),
+          }
+        : null,
       accountSettings: {
         readReceipts: storage.get('read-receipt-setting'),
         sealedSenderIndicators: storage.get('sealedSenderIndicators'),
@@ -361,6 +534,9 @@ export class BackupExportStream extends Readable {
         storyViewReceiptsEnabled: storage.get('storyViewReceiptsEnabled'),
         hasCompletedUsernameOnboarding: storage.get(
           'hasCompletedUsernameOnboarding'
+        ),
+        hasSeenGroupStoryEducationSheet: storage.get(
+          'hasSeenGroupStoryEducationSheet'
         ),
         phoneNumberSharingMode,
       },
@@ -441,7 +617,17 @@ export class BackupExportStream extends Readable {
     if (isMe(convo)) {
       res.self = {};
     } else if (isDirectConversation(convo)) {
-      const { Registered } = Backups.Contact;
+      let visibility: Backups.Contact.Visibility;
+      if (convo.removalStage == null) {
+        visibility = Backups.Contact.Visibility.VISIBLE;
+      } else if (convo.removalStage === 'justNotification') {
+        visibility = Backups.Contact.Visibility.HIDDEN;
+      } else if (convo.removalStage === 'messageRequest') {
+        visibility = Backups.Contact.Visibility.HIDDEN_MESSAGE_REQUEST;
+      } else {
+        throw missingCaseError(convo.removalStage);
+      }
+
       res.contact = {
         aci:
           convo.serviceId && convo.serviceId !== convo.pni
@@ -455,13 +641,18 @@ export class BackupExportStream extends Readable {
         blocked: convo.serviceId
           ? window.storage.blocked.isServiceIdBlocked(convo.serviceId)
           : null,
-        hidden: convo.removalStage !== undefined,
-        registered: isConversationUnregistered(convo)
-          ? Registered.NOT_REGISTERED
-          : Registered.REGISTERED,
-        unregisteredTimestamp: convo.firstUnregisteredAt
-          ? Long.fromNumber(convo.firstUnregisteredAt)
-          : null,
+        visibility,
+        ...(isConversationUnregistered(convo)
+          ? {
+              notRegistered: {
+                unregisteredTimestamp: convo.firstUnregisteredAt
+                  ? Long.fromNumber(convo.firstUnregisteredAt)
+                  : null,
+              },
+            }
+          : {
+              registered: {},
+            }),
         profileKey: convo.profileKey
           ? Bytes.fromBase64(convo.profileKey)
           : null,
@@ -484,11 +675,92 @@ export class BackupExportStream extends Readable {
           break;
       }
 
+      const masterKey = Bytes.fromBase64(convo.masterKey);
+
+      let publicKey;
+      if (convo.publicParams) {
+        publicKey = Bytes.fromBase64(convo.publicParams);
+      } else {
+        ({ publicParams: publicKey } = deriveGroupFields(masterKey));
+      }
+
       res.group = {
-        masterKey: Bytes.fromBase64(convo.masterKey),
+        masterKey,
         whitelisted: convo.profileSharing,
         hideStory: convo.hideStory === true,
         storySendMode,
+        snapshot: {
+          publicKey,
+          title: {
+            title: convo.name ?? '',
+          },
+          description: {
+            descriptionText: convo.description ?? '',
+          },
+          avatarUrl: convo.avatar?.url,
+          disappearingMessagesTimer:
+            convo.expireTimer != null
+              ? {
+                  disappearingMessagesDuration: DurationInSeconds.toSeconds(
+                    convo.expireTimer
+                  ),
+                }
+              : null,
+          accessControl: convo.accessControl,
+          version: convo.revision || 0,
+          members: convo.membersV2?.map(member => {
+            const memberConvo = window.ConversationController.get(member.aci);
+            strictAssert(memberConvo, 'Missing GV2 member');
+
+            const { profileKey } = memberConvo.attributes;
+
+            return {
+              userId: this.aciToBytes(member.aci),
+              role: member.role,
+              profileKey: profileKey
+                ? Bytes.fromBase64(profileKey)
+                : ZERO_PROFILE_KEY,
+              joinedAtVersion: member.joinedAtVersion,
+            };
+          }),
+          membersPendingProfileKey: convo.pendingMembersV2?.map(member => {
+            return {
+              member: {
+                userId: this.serviceIdToBytes(member.serviceId),
+                role: member.role,
+                profileKey: ZERO_PROFILE_KEY,
+                joinedAtVersion: 0,
+              },
+              addedByUserId: this.aciToBytes(member.addedByUserId),
+              timestamp: getSafeLongFromTimestamp(member.timestamp),
+            };
+          }),
+          membersPendingAdminApproval: convo.pendingAdminApprovalV2?.map(
+            member => {
+              const memberConvo = window.ConversationController.get(member.aci);
+              strictAssert(memberConvo, 'Missing GV2 member pending approval');
+
+              const { profileKey } = memberConvo.attributes;
+              return {
+                userId: this.aciToBytes(member.aci),
+                profileKey: profileKey
+                  ? Bytes.fromBase64(profileKey)
+                  : ZERO_PROFILE_KEY,
+                timestamp: getSafeLongFromTimestamp(member.timestamp),
+              };
+            }
+          ),
+          membersBanned: convo.bannedMembersV2?.map(member => {
+            return {
+              userId: this.serviceIdToBytes(member.serviceId),
+              timestamp: getSafeLongFromTimestamp(member.timestamp),
+            };
+          }),
+          inviteLinkPassword: convo.groupInviteLinkPassword
+            ? Bytes.fromBase64(convo.groupInviteLinkPassword)
+            : null,
+          announcementsOnly: convo.announcementsOnly === true,
+        },
       };
     } else {
       return undefined;
@@ -498,30 +770,22 @@ export class BackupExportStream extends Readable {
   }
 
   private async toChatItem(
-    message: MessageAttributesType
+    message: MessageAttributesType,
+    { aboutMe, callHistoryByCallId, backupLevel }: ToChatItemOptionsType
   ): Promise<Backups.IChatItem | undefined> {
-    if (!isNormalBubble(message)) {
-      return undefined;
-    }
-
     const chatId = this.getRecipientId({ id: message.conversationId });
     if (chatId === undefined) {
       log.warn('backups: message chat not found');
       return undefined;
     }
 
-    let authorId: Long;
+    let authorId: Long | undefined;
 
     const isOutgoing = message.type === 'outgoing';
+    const isIncoming = message.type === 'incoming';
 
-    if (isOutgoing) {
-      const ourAci = window.storage.user.getCheckedAci();
-
-      authorId = this.getOrPushPrivateRecipient({
-        serviceId: ourAci,
-      });
-      // Pacify typescript
-    } else if (message.sourceServiceId) {
+    // Pacify typescript
+    if (message.sourceServiceId) {
       authorId = this.getOrPushPrivateRecipient({
         serviceId: message.sourceServiceId,
         e164: message.source,
@@ -532,125 +796,1035 @@ export class BackupExportStream extends Readable {
         e164: message.source,
       });
     } else {
-      return undefined;
+      strictAssert(!isIncoming, 'Incoming message must have source');
+
+      // Author must be always present, even if we are directionless
+      authorId = this.getOrPushPrivateRecipient({
+        serviceId: aboutMe.aci,
+      });
+    }
+
+    if (isOutgoing || isIncoming) {
+      strictAssert(authorId, 'Incoming/outgoing messages require an author');
+    }
+
+    let expireStartDate: Long | undefined;
+    let expiresInMs: Long | undefined;
+    if (
+      message.expireTimer != null &&
+      message.expirationStartTimestamp != null
+    ) {
+      expireStartDate = getSafeLongFromTimestamp(
+        message.expirationStartTimestamp
+      );
+      expiresInMs = Long.fromNumber(
+        DurationInSeconds.toMillis(message.expireTimer)
+      );
     }
 
     const result: Backups.IChatItem = {
       chatId,
       authorId,
-      dateSent: getSafeLongFromTimestamp(message.sent_at),
-      expireStartDate:
-        message.expirationStartTimestamp != null
-          ? getSafeLongFromTimestamp(message.expirationStartTimestamp)
-          : null,
-      expiresInMs:
-        message.expireTimer != null
-          ? Long.fromNumber(DurationInSeconds.toMillis(message.expireTimer))
-          : null,
+      dateSent: getSafeLongFromTimestamp(
+        message.editMessageTimestamp || message.sent_at
+      ),
+      expireStartDate,
+      expiresInMs,
       revisions: [],
-      sms: false,
-      standardMessage: {
-        quote: await this.toQuote(message.quote),
-        text: {
-          // Note that we store full text on the message model so we have to
-          // trim it before serializing.
-          body: message.body?.slice(0, LONG_ATTACHMENT_LIMIT),
-          bodyRanges: message.bodyRanges?.map(range => this.toBodyRange(range)),
-        },
-
-        linkPreview: message.preview?.map(preview => {
-          return {
-            url: preview.url,
-            title: preview.title,
-            description: preview.description,
-            date: getSafeLongFromTimestamp(preview.date),
-          };
-        }),
-        reactions: message.reactions?.map(reaction => {
-          return {
-            emoji: reaction.emoji,
-            authorId: this.getOrPushPrivateRecipient({
-              id: reaction.fromId,
-            }),
-            sentTimestamp: getSafeLongFromTimestamp(reaction.timestamp),
-            receivedTimestamp: getSafeLongFromTimestamp(
-              reaction.receivedAtDate ?? reaction.timestamp
-            ),
-          };
-        }),
-      },
+      sms: message.sms === true,
     };
 
-    if (isOutgoing) {
-      const BackupSendStatus = Backups.SendStatus.Status;
+    if (!isNormalBubble(message)) {
+      const { patch, kind } = await this.toChatItemFromNonBubble({
+        authorId,
+        message,
+        aboutMe,
+        callHistoryByCallId,
+      });
 
-      const sendStatus = new Array<Backups.ISendStatus>();
-      const { sendStateByConversationId = {} } = message;
-      for (const [id, entry] of Object.entries(sendStateByConversationId)) {
-        const target = window.ConversationController.get(id);
-        strictAssert(target != null, 'Send target not found');
-
-        let deliveryStatus: Backups.SendStatus.Status;
-        switch (entry.status) {
-          case SendStatus.Pending:
-            deliveryStatus = BackupSendStatus.PENDING;
-            break;
-          case SendStatus.Sent:
-            deliveryStatus = BackupSendStatus.SENT;
-            break;
-          case SendStatus.Delivered:
-            deliveryStatus = BackupSendStatus.DELIVERED;
-            break;
-          case SendStatus.Read:
-            deliveryStatus = BackupSendStatus.READ;
-            break;
-          case SendStatus.Viewed:
-            deliveryStatus = BackupSendStatus.VIEWED;
-            break;
-          case SendStatus.Failed:
-            deliveryStatus = BackupSendStatus.FAILED;
-            break;
-          default:
-            throw missingCaseError(entry.status);
-        }
-
-        sendStatus.push({
-          recipientId: this.getOrPushPrivateRecipient(target.attributes),
-          lastStatusUpdateTimestamp:
-            entry.updatedAt != null
-              ? getSafeLongFromTimestamp(entry.updatedAt)
-              : null,
-          deliveryStatus,
-        });
+      if (kind === NonBubbleResultKind.Drop) {
+        return undefined;
       }
-      result.outgoing = {
-        sendStatus,
+
+      if (kind === NonBubbleResultKind.Directed) {
+        strictAssert(
+          authorId,
+          'Incoming/outgoing non-bubble messages require an author'
+        );
+        const me = this.getOrPushPrivateRecipient({
+          serviceId: aboutMe.aci,
+        });
+
+        if (authorId === me) {
+          result.outgoing = this.getOutgoingMessageDetails(
+            message.sent_at,
+            message
+          );
+        } else {
+          result.incoming = this.getIncomingMessageDetails(message);
+        }
+      } else if (kind === NonBubbleResultKind.Directionless) {
+        result.directionless = {};
+      } else {
+        throw missingCaseError(kind);
+      }
+
+      return { ...result, ...patch };
+    }
+
+    const { contact, sticker } = message;
+    if (message.isErased) {
+      result.remoteDeletedMessage = {};
+    } else if (messageHasPaymentEvent(message)) {
+      const { payment } = message;
+      switch (payment.kind) {
+        case PaymentEventKind.ActivationRequest: {
+          result.updateMessage = {
+            simpleUpdate: {
+              type: Backups.SimpleChatUpdate.Type.PAYMENT_ACTIVATION_REQUEST,
+            },
+          };
+          break;
+        }
+        case PaymentEventKind.Activation: {
+          result.updateMessage = {
+            simpleUpdate: {
+              type: Backups.SimpleChatUpdate.Type.PAYMENTS_ACTIVATED,
+            },
+          };
+          break;
+        }
+        case PaymentEventKind.Notification:
+          result.paymentNotification = {
+            note: payment.note || undefined,
+            amountMob: payment.amountMob,
+            feeMob: payment.feeMob,
+            transactionDetails: payment.transactionDetailsBase64
+              ? Backups.PaymentNotification.TransactionDetails.decode(
+                  Bytes.fromBase64(payment.transactionDetailsBase64)
+                )
+              : undefined,
+          };
+          break;
+        default:
+          throw missingCaseError(payment);
+      }
+    } else if (contact && contact[0]) {
+      const contactMessage = new Backups.ContactMessage();
+
+      contactMessage.contact = await Promise.all(
+        contact.map(async contactDetails => ({
+          ...contactDetails,
+          number: contactDetails.number?.map(number => ({
+            ...number,
+            type: numberToPhoneType(number.type),
+          })),
+          email: contactDetails.email?.map(email => ({
+            ...email,
+            type: numberToPhoneType(email.type),
+          })),
+          address: contactDetails.address?.map(address => ({
+            ...address,
+            type: numberToAddressType(address.type),
+          })),
+          avatar: contactDetails.avatar?.avatar
+            ? await this.processAttachment({
+                attachment: contactDetails.avatar.avatar,
+                backupLevel,
+                messageReceivedAt: message.received_at,
+              })
+            : undefined,
+        }))
+      );
+
+      const reactions = this.getMessageReactions(message);
+      if (reactions != null) {
+        contactMessage.reactions = reactions;
+      }
+
+      result.contactMessage = contactMessage;
+    } else if (sticker) {
+      const stickerProto = new Backups.Sticker();
+      stickerProto.emoji = sticker.emoji;
+      stickerProto.packId = Bytes.fromHex(sticker.packId);
+      stickerProto.packKey = Bytes.fromBase64(sticker.packKey);
+      stickerProto.stickerId = sticker.stickerId;
+      stickerProto.data = sticker.data
+        ? await this.processAttachment({
+            attachment: sticker.data,
+            backupLevel,
+            messageReceivedAt: message.received_at,
+          })
+        : undefined;
+
+      result.stickerMessage = {
+        sticker: stickerProto,
+        reactions: this.getMessageReactions(message),
+      };
+    } else if (isGiftBadge(message)) {
+      const { giftBadge } = message;
+      strictAssert(giftBadge != null, 'Message must have gift badge');
+
+      let state: Backups.GiftBadge.State;
+      switch (giftBadge.state) {
+        case GiftBadgeStates.Unopened:
+          state = Backups.GiftBadge.State.UNOPENED;
+          break;
+        case GiftBadgeStates.Opened:
+          state = Backups.GiftBadge.State.OPENED;
+          break;
+        case GiftBadgeStates.Redeemed:
+          state = Backups.GiftBadge.State.REDEEMED;
+          break;
+        default:
+          throw missingCaseError(giftBadge.state);
+      }
+
+      result.giftBadge = {
+        receiptCredentialPresentation: Bytes.fromBase64(
+          giftBadge.receiptCredentialPresentation
+        ),
+        state,
       };
     } else {
-      result.incoming = {
-        dateReceived:
-          message.received_at_ms != null
-            ? getSafeLongFromTimestamp(message.received_at_ms)
-            : null,
-        dateServerSent:
-          message.serverTimestamp != null
-            ? getSafeLongFromTimestamp(message.serverTimestamp)
-            : null,
-        read: Boolean(message.readAt),
-      };
+      result.standardMessage = await this.toStandardMessage(
+        message,
+        backupLevel
+      );
+      result.revisions = await this.toChatItemRevisions(
+        result,
+        message,
+        backupLevel
+      );
+    }
+
+    if (isOutgoing) {
+      result.outgoing = this.getOutgoingMessageDetails(
+        message.sent_at,
+        message
+      );
+    } else {
+      result.incoming = this.getIncomingMessageDetails(message);
     }
 
     return result;
   }
 
-  private async toQuote(
-    quote?: QuotedMessageType
-  ): Promise<Backups.IQuote | null> {
+  private aciToBytes(aci: AciString | string): Uint8Array {
+    return Aci.parseFromServiceIdString(aci).getRawUuidBytes();
+  }
+  private serviceIdToBytes(serviceId: ServiceIdString): Uint8Array {
+    return ServiceId.parseFromServiceIdString(serviceId).getRawUuidBytes();
+  }
+
+  private async toChatItemFromNonBubble(
+    options: NonBubbleOptionsType
+  ): Promise<NonBubbleResultType> {
+    return this.toChatItemUpdate(options);
+  }
+
+  async toChatItemUpdate(
+    options: NonBubbleOptionsType
+  ): Promise<NonBubbleResultType> {
+    const { authorId, message } = options;
+    const logId = `toChatItemUpdate(${getMessageIdForLogging(message)})`;
+
+    const updateMessage = new Backups.ChatUpdateMessage();
+
+    const patch: Backups.IChatItem = {
+      updateMessage,
+    };
+
+    if (isCallHistory(message)) {
+      // TODO (DESKTOP-6964)
+      // const callingMessage = new Backups.CallChatUpdate();
+      // const { callId } = message;
+      // if (!callId) {
+      //   throw new Error(
+      //     `${logId}: Message was callHistory, but missing callId!`
+      //   );
+      // }
+      // const callHistory = callHistoryByCallId[callId];
+      // if (!callHistory) {
+      //   throw new Error(
+      //     `${logId}: Message had callId, but no call history details were found!`
+      //   );
+      // }
+      // callingMessage.callId = Long.fromString(callId);
+      // if (callHistory.mode === CallMode.Group) {
+      //   const groupCall = new Backups.GroupCallChatUpdate();
+      //   const { ringerId } = callHistory;
+      //   if (!ringerId) {
+      //     throw new Error(
+      //       `${logId}: Message had missing ringerId for a group call!`
+      //     );
+      //   }
+      //   groupCall.startedCallAci = this.aciToBytes(ringerId);
+      //   groupCall.startedCallTimestamp = Long.fromNumber(callHistory.timestamp);
+      //   // Note: we don't store inCallACIs, instead relying on RingRTC in-memory state
+      //   callingMessage.groupCall = groupCall;
+      // } else {
+      //   const callMessage = new Backups.IndividualCallChatUpdate();
+      //   const { direction, type, status } = callHistory;
+      //   if (
+      //     status === DirectCallStatus.Accepted ||
+      //     status === DirectCallStatus.Pending
+      //   ) {
+      //     if (type === CallType.Audio) {
+      //       callMessage.type =
+      //         direction === CallDirection.Incoming
+      //           ? Backups.IndividualCallChatUpdate.Type.INCOMING_AUDIO_CALL
+      //           : Backups.IndividualCallChatUpdate.Type.OUTGOING_AUDIO_CALL;
+      //     } else if (type === CallType.Video) {
+      //       callMessage.type =
+      //         direction === CallDirection.Incoming
+      //           ? Backups.IndividualCallChatUpdate.Type.INCOMING_VIDEO_CALL
+      //           : Backups.IndividualCallChatUpdate.Type.OUTGOING_VIDEO_CALL;
+      //     } else {
+      //       throw new Error(
+      //         `${logId}: Message direct status '${status}' call had type ${type}`
+      //       );
+      //     }
+      //   } else if (status === DirectCallStatus.Declined) {
+      //     if (direction === CallDirection.Incoming) {
+      //       // question: do we really not call declined calls things that we decline?
+      //       throw new Error(
+      //         `${logId}: Message direct call was declined but incoming`
+      //       );
+      //     }
+      //     if (type === CallType.Audio) {
+      //       callMessage.type =
+      //         Backups.IndividualCallChatUpdate.Type.UNANSWERED_OUTGOING_AUDIO_CALL;
+      //     } else if (type === CallType.Video) {
+      //       callMessage.type =
+      //         Backups.IndividualCallChatUpdate.Type.UNANSWERED_OUTGOING_VIDEO_CALL;
+      //     } else {
+      //       throw new Error(
+      //         `${logId}: Message direct status '${status}' call had type ${type}`
+      //       );
+      //     }
+      //   } else if (status === DirectCallStatus.Missed) {
+      //     if (direction === CallDirection.Outgoing) {
+      //       throw new Error(
+      //         `${logId}: Message direct call was missed but outgoing`
+      //       );
+      //     }
+      //     if (type === CallType.Audio) {
+      //       callMessage.type =
+      //         Backups.IndividualCallChatUpdate.Type.MISSED_INCOMING_AUDIO_CALL;
+      //     } else if (type === CallType.Video) {
+      //       callMessage.type =
+      //         Backups.IndividualCallChatUpdate.Type.MISSED_INCOMING_VIDEO_CALL;
+      //     } else {
+      //       throw new Error(
+      //         `${logId}: Message direct status '${status}' call had type ${type}`
+      //       );
+      //     }
+      //   } else {
+      //     throw new Error(`${logId}: Message direct call had status ${status}`);
+      //   }
+      //   callingMessage.callMessage = callMessage;
+      // }
+      // updateMessage.callingMessage = callingMessage;
+      // return chatItem;
+    }
+
+    if (isExpirationTimerUpdate(message)) {
+      const expiresInSeconds = message.expirationTimerUpdate?.expireTimer;
+      const expiresInMs = (expiresInSeconds ?? 0) * 1000;
+
+      const conversation = window.ConversationController.get(
+        message.conversationId
+      );
+
+      if (conversation && isGroup(conversation.attributes)) {
+        const groupChatUpdate = new Backups.GroupChangeChatUpdate();
+
+        const timerUpdate = new Backups.GroupExpirationTimerUpdate();
+        timerUpdate.expiresInMs = expiresInMs;
+
+        const sourceServiceId = message.expirationTimerUpdate?.sourceServiceId;
+        if (sourceServiceId && Aci.parseFromServiceIdString(sourceServiceId)) {
+          timerUpdate.updaterAci = uuidToBytes(sourceServiceId);
+        }
+
+        const innerUpdate = new Backups.GroupChangeChatUpdate.Update();
+
+        innerUpdate.groupExpirationTimerUpdate = timerUpdate;
+
+        groupChatUpdate.updates = [innerUpdate];
+
+        updateMessage.groupChange = groupChatUpdate;
+
+        return { kind: NonBubbleResultKind.Directionless, patch };
+      }
+
+      const source =
+        message.expirationTimerUpdate?.sourceServiceId ||
+        message.expirationTimerUpdate?.source;
+      if (source && !authorId) {
+        patch.authorId = this.getOrPushPrivateRecipient({
+          id: source,
+        });
+      }
+
+      const expirationTimerChange = new Backups.ExpirationTimerChatUpdate();
+      expirationTimerChange.expiresInMs = expiresInMs;
+
+      updateMessage.expirationTimerChange = expirationTimerChange;
+
+      return { kind: NonBubbleResultKind.Directionless, patch };
+    }
+
+    if (isGroupV2Change(message)) {
+      updateMessage.groupChange = await this.toGroupV2Update(message, options);
+
+      return { kind: NonBubbleResultKind.Directionless, patch };
+    }
+
+    if (isKeyChange(message)) {
+      const simpleUpdate = new Backups.SimpleChatUpdate();
+      simpleUpdate.type = Backups.SimpleChatUpdate.Type.IDENTITY_UPDATE;
+
+      if (message.key_changed) {
+        // This will override authorId on the original chatItem
+        patch.authorId = this.getOrPushPrivateRecipient({
+          id: message.key_changed,
+        });
+      }
+
+      updateMessage.simpleUpdate = simpleUpdate;
+
+      return { kind: NonBubbleResultKind.Directionless, patch };
+    }
+
+    if (isProfileChange(message)) {
+      const profileChange = new Backups.ProfileChangeChatUpdate();
+      if (!message.profileChange) {
+        return { kind: NonBubbleResultKind.Drop };
+      }
+
+      if (message.changedId) {
+        // This will override authorId on the original chatItem
+        patch.authorId = this.getOrPushPrivateRecipient({
+          id: message.changedId,
+        });
+      }
+
+      const { newName, oldName } = message.profileChange;
+      profileChange.newName = newName;
+      profileChange.previousName = oldName;
+
+      updateMessage.profileChange = profileChange;
+
+      return { kind: NonBubbleResultKind.Directionless, patch };
+    }
+
+    if (isVerifiedChange(message)) {
+      if (!message.verifiedChanged) {
+        throw new Error(
+          `${logId}: Message was verifiedChange, but missing verifiedChange!`
+        );
+      }
+
+      const simpleUpdate = new Backups.SimpleChatUpdate();
+      simpleUpdate.type = message.verified
+        ? Backups.SimpleChatUpdate.Type.IDENTITY_VERIFIED
+        : Backups.SimpleChatUpdate.Type.IDENTITY_DEFAULT;
+
+      updateMessage.simpleUpdate = simpleUpdate;
+
+      if (message.verifiedChanged) {
+        // This will override authorId on the original chatItem
+        patch.authorId = this.getOrPushPrivateRecipient({
+          id: message.verifiedChanged,
+        });
+      }
+
+      return { kind: NonBubbleResultKind.Directionless, patch };
+    }
+
+    if (isChangeNumberNotification(message)) {
+      updateMessage.simpleUpdate = {
+        type: Backups.SimpleChatUpdate.Type.CHANGE_NUMBER,
+      };
+
+      return { kind: NonBubbleResultKind.Directionless, patch };
+    }
+
+    if (isJoinedSignalNotification(message)) {
+      updateMessage.simpleUpdate = {
+        type: Backups.SimpleChatUpdate.Type.JOINED_SIGNAL,
+      };
+
+      return { kind: NonBubbleResultKind.Directionless, patch };
+    }
+
+    if (isTitleTransitionNotification(message)) {
+      strictAssert(
+        message.titleTransition != null,
+        'Missing title transition data'
+      );
+      const { renderInfo } = message.titleTransition;
+      if (renderInfo.e164) {
+        updateMessage.learnedProfileChange = {
+          e164: Long.fromString(renderInfo.e164),
+        };
+      } else {
+        strictAssert(
+          renderInfo.username,
+          'Title transition must have username or e164'
+        );
+        updateMessage.learnedProfileChange = { username: renderInfo.username };
+      }
+
+      return { kind: NonBubbleResultKind.Directionless, patch };
+    }
+
+    if (isDeliveryIssue(message)) {
+      updateMessage.simpleUpdate = {
+        type: Backups.SimpleChatUpdate.Type.BAD_DECRYPT,
+      };
+
+      return { kind: NonBubbleResultKind.Directionless, patch };
+    }
+
+    if (isConversationMerge(message)) {
+      const threadMerge = new Backups.ThreadMergeChatUpdate();
+      const e164 = message.conversationMerge?.renderInfo.e164;
+      if (!e164) {
+        return { kind: NonBubbleResultKind.Drop };
+      }
+      threadMerge.previousE164 = Long.fromString(e164);
+
+      updateMessage.threadMerge = threadMerge;
+
+      return { kind: NonBubbleResultKind.Directionless, patch };
+    }
+
+    if (isPhoneNumberDiscovery(message)) {
+      const e164 = message.phoneNumberDiscovery?.e164;
+      if (!e164) {
+        return { kind: NonBubbleResultKind.Drop };
+      }
+
+      updateMessage.sessionSwitchover = {
+        e164: Long.fromString(e164),
+      };
+      return { kind: NonBubbleResultKind.Directionless, patch };
+    }
+
+    if (isUniversalTimerNotification(message)) {
+      // Transient, drop it
+      return { kind: NonBubbleResultKind.Drop };
+    }
+
+    if (isContactRemovedNotification(message)) {
+      // Transient, drop it
+      return { kind: NonBubbleResultKind.Drop };
+    }
+
+    if (isGroupUpdate(message)) {
+      // GV1 is deprecated.
+      return { kind: NonBubbleResultKind.Drop };
+    }
+
+    if (isUnsupportedMessage(message)) {
+      const simpleUpdate = new Backups.SimpleChatUpdate();
+      simpleUpdate.type =
+        Backups.SimpleChatUpdate.Type.UNSUPPORTED_PROTOCOL_MESSAGE;
+
+      updateMessage.simpleUpdate = simpleUpdate;
+
+      return { kind: NonBubbleResultKind.Directed, patch };
+    }
+
+    if (isGroupV1Migration(message)) {
+      const { groupMigration } = message;
+
+      const groupChatUpdate = new Backups.GroupChangeChatUpdate();
+
+      groupChatUpdate.updates = [];
+
+      const areWeInvited = groupMigration?.areWeInvited ?? false;
+      const droppedMemberCount =
+        groupMigration?.droppedMemberCount ??
+        groupMigration?.droppedMemberIds?.length ??
+        message.droppedGV2MemberIds?.length ??
+        0;
+      const invitedMemberCount =
+        groupMigration?.invitedMemberCount ??
+        groupMigration?.invitedMembers?.length ??
+        message.invitedGV2Members?.length ??
+        0;
+
+      let addedItem = false;
+      if (areWeInvited) {
+        const container = new Backups.GroupChangeChatUpdate.Update();
+        container.groupV2MigrationSelfInvitedUpdate =
+          new Backups.GroupV2MigrationSelfInvitedUpdate();
+        groupChatUpdate.updates.push(container);
+        addedItem = true;
+      }
+      if (droppedMemberCount > 0) {
+        const container = new Backups.GroupChangeChatUpdate.Update();
+        const update = new Backups.GroupV2MigrationDroppedMembersUpdate();
+        update.droppedMembersCount = droppedMemberCount;
+        container.groupV2MigrationDroppedMembersUpdate = update;
+        groupChatUpdate.updates.push(container);
+        addedItem = true;
+      }
+      if (invitedMemberCount > 0) {
+        const container = new Backups.GroupChangeChatUpdate.Update();
+        const update = new Backups.GroupV2MigrationInvitedMembersUpdate();
+        update.invitedMembersCount = invitedMemberCount;
+        container.groupV2MigrationInvitedMembersUpdate = update;
+        groupChatUpdate.updates.push(container);
+        addedItem = true;
+      }
+
+      if (!addedItem) {
+        const container = new Backups.GroupChangeChatUpdate.Update();
+        container.groupV2MigrationUpdate = new Backups.GroupV2MigrationUpdate();
+        groupChatUpdate.updates.push(container);
+      }
+
+      updateMessage.groupChange = groupChatUpdate;
+
+      return { kind: NonBubbleResultKind.Directionless, patch };
+    }
+
+    if (isEndSession(message)) {
+      const simpleUpdate = new Backups.SimpleChatUpdate();
+      simpleUpdate.type = Backups.SimpleChatUpdate.Type.END_SESSION;
+
+      updateMessage.simpleUpdate = simpleUpdate;
+
+      return { kind: NonBubbleResultKind.Directed, patch };
+    }
+
+    if (isChatSessionRefreshed(message)) {
+      const simpleUpdate = new Backups.SimpleChatUpdate();
+      simpleUpdate.type = Backups.SimpleChatUpdate.Type.CHAT_SESSION_REFRESH;
+
+      updateMessage.simpleUpdate = simpleUpdate;
+
+      return { kind: NonBubbleResultKind.Directionless, patch };
+    }
+
+    throw new Error(
+      `${logId}: Message was not a bubble, but didn't understand type`
+    );
+  }
+
+  async toGroupV2Update(
+    message: MessageAttributesType,
+    options: {
+      aboutMe: AboutMe;
+    }
+  ): Promise<Backups.GroupChangeChatUpdate | undefined> {
+    const logId = `toGroupV2Update(${getMessageIdForLogging(message)})`;
+
+    const { groupV2Change } = message;
+    const { aboutMe } = options;
+    if (!isGroupV2Change(message) || !groupV2Change) {
+      throw new Error(`${logId}: Message was not a groupv2 change`);
+    }
+
+    const { from, details } = groupV2Change;
+    const updates: Array<Backups.GroupChangeChatUpdate.Update> = [];
+
+    details.forEach(detail => {
+      const update = new Backups.GroupChangeChatUpdate.Update();
+      const { type } = detail;
+
+      if (type === 'create') {
+        const innerUpdate = new Backups.GroupCreationUpdate();
+        if (from) {
+          innerUpdate.updaterAci = this.serviceIdToBytes(from);
+        }
+        update.groupCreationUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'access-attributes') {
+        const innerUpdate =
+          new Backups.GroupAttributesAccessLevelChangeUpdate();
+        if (from) {
+          innerUpdate.updaterAci = this.serviceIdToBytes(from);
+        }
+        innerUpdate.accessLevel = detail.newPrivilege;
+
+        update.groupAttributesAccessLevelChangeUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'access-members') {
+        const innerUpdate =
+          new Backups.GroupMembershipAccessLevelChangeUpdate();
+        if (from) {
+          innerUpdate.updaterAci = this.serviceIdToBytes(from);
+        }
+        innerUpdate.accessLevel = detail.newPrivilege;
+
+        update.groupMembershipAccessLevelChangeUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'access-invite-link') {
+        const innerUpdate = new Backups.GroupInviteLinkAdminApprovalUpdate();
+        if (from) {
+          innerUpdate.updaterAci = this.serviceIdToBytes(from);
+        }
+        innerUpdate.linkRequiresAdminApproval =
+          detail.newPrivilege ===
+          SignalService.AccessControl.AccessRequired.ADMINISTRATOR;
+
+        update.groupInviteLinkAdminApprovalUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'announcements-only') {
+        const innerUpdate = new Backups.GroupAnnouncementOnlyChangeUpdate();
+        if (from) {
+          innerUpdate.updaterAci = this.serviceIdToBytes(from);
+        }
+        innerUpdate.isAnnouncementOnly = detail.announcementsOnly;
+
+        update.groupAnnouncementOnlyChangeUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'avatar') {
+        const innerUpdate = new Backups.GroupAvatarUpdate();
+        if (from) {
+          innerUpdate.updaterAci = this.serviceIdToBytes(from);
+        }
+        innerUpdate.wasRemoved = detail.removed;
+
+        update.groupAvatarUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'title') {
+        const innerUpdate = new Backups.GroupNameUpdate();
+        if (from) {
+          innerUpdate.updaterAci = this.serviceIdToBytes(from);
+        }
+        innerUpdate.newGroupName = detail.newTitle;
+
+        update.groupNameUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'group-link-add') {
+        const innerUpdate = new Backups.GroupInviteLinkEnabledUpdate();
+        if (from) {
+          innerUpdate.updaterAci = this.serviceIdToBytes(from);
+        }
+        innerUpdate.linkRequiresAdminApproval =
+          detail.privilege ===
+          SignalService.AccessControl.AccessRequired.ADMINISTRATOR;
+
+        update.groupInviteLinkEnabledUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'group-link-reset') {
+        const innerUpdate = new Backups.GroupInviteLinkResetUpdate();
+        if (from) {
+          innerUpdate.updaterAci = this.serviceIdToBytes(from);
+        }
+
+        update.groupInviteLinkResetUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'group-link-remove') {
+        const innerUpdate = new Backups.GroupInviteLinkDisabledUpdate();
+        if (from) {
+          innerUpdate.updaterAci = this.serviceIdToBytes(from);
+        }
+
+        update.groupInviteLinkDisabledUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'member-add') {
+        if (from && from === detail.aci) {
+          const innerUpdate = new Backups.GroupMemberJoinedUpdate();
+          innerUpdate.newMemberAci = this.serviceIdToBytes(from);
+
+          update.groupMemberJoinedUpdate = innerUpdate;
+          updates.push(update);
+          return;
+        }
+
+        const innerUpdate = new Backups.GroupMemberAddedUpdate();
+        if (from) {
+          innerUpdate.updaterAci = this.serviceIdToBytes(from);
+        }
+        innerUpdate.newMemberAci = this.aciToBytes(detail.aci);
+
+        update.groupMemberAddedUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'member-add-from-invite') {
+        const { aci, pni } = detail;
+        if (
+          from &&
+          ((pni && from === pni) ||
+            (aci && from === aci) ||
+            checkServiceIdEquivalence(from, aci))
+        ) {
+          const innerUpdate = new Backups.GroupInvitationAcceptedUpdate();
+          innerUpdate.newMemberAci = this.aciToBytes(detail.aci);
+          if (detail.inviter) {
+            innerUpdate.inviterAci = this.aciToBytes(detail.inviter);
+          }
+          update.groupInvitationAcceptedUpdate = innerUpdate;
+          updates.push(update);
+          return;
+        }
+
+        const innerUpdate = new Backups.GroupMemberAddedUpdate();
+        innerUpdate.newMemberAci = this.aciToBytes(detail.aci);
+        if (from) {
+          innerUpdate.updaterAci = this.serviceIdToBytes(from);
+        }
+        if (detail.inviter) {
+          innerUpdate.inviterAci = this.aciToBytes(detail.inviter);
+        }
+        innerUpdate.hadOpenInvitation = true;
+
+        update.groupMemberAddedUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'member-add-from-link') {
+        const innerUpdate = new Backups.GroupMemberJoinedByLinkUpdate();
+        innerUpdate.newMemberAci = this.aciToBytes(detail.aci);
+
+        update.groupMemberJoinedByLinkUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'member-add-from-admin-approval') {
+        const innerUpdate = new Backups.GroupJoinRequestApprovalUpdate();
+        if (from) {
+          innerUpdate.updaterAci = this.serviceIdToBytes(from);
+        }
+
+        innerUpdate.requestorAci = this.aciToBytes(detail.aci);
+        innerUpdate.wasApproved = true;
+
+        update.groupJoinRequestApprovalUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'member-privilege') {
+        const innerUpdate = new Backups.GroupAdminStatusUpdate();
+        if (from) {
+          innerUpdate.updaterAci = this.serviceIdToBytes(from);
+        }
+
+        innerUpdate.memberAci = this.aciToBytes(detail.aci);
+        innerUpdate.wasAdminStatusGranted =
+          detail.newPrivilege === SignalService.Member.Role.ADMINISTRATOR;
+
+        update.groupAdminStatusUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'member-remove') {
+        if (from && from === detail.aci) {
+          const innerUpdate = new Backups.GroupMemberLeftUpdate();
+          innerUpdate.aci = this.serviceIdToBytes(from);
+
+          update.groupMemberLeftUpdate = innerUpdate;
+          updates.push(update);
+          return;
+        }
+
+        const innerUpdate = new Backups.GroupMemberRemovedUpdate();
+        if (from) {
+          innerUpdate.removerAci = this.serviceIdToBytes(from);
+        }
+        innerUpdate.removedAci = this.aciToBytes(detail.aci);
+
+        update.groupMemberRemovedUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'pending-add-one') {
+        if (
+          (aboutMe.aci && detail.serviceId === aboutMe.aci) ||
+          (aboutMe.pni && detail.serviceId === aboutMe.pni)
+        ) {
+          const innerUpdate = new Backups.SelfInvitedToGroupUpdate();
+          if (from) {
+            innerUpdate.inviterAci = this.serviceIdToBytes(from);
+          }
+
+          update.selfInvitedToGroupUpdate = innerUpdate;
+          updates.push(update);
+          return;
+        }
+        if (
+          from &&
+          ((aboutMe.aci && from === aboutMe.aci) ||
+            (aboutMe.pni && from === aboutMe.pni))
+        ) {
+          const innerUpdate = new Backups.SelfInvitedOtherUserToGroupUpdate();
+          innerUpdate.inviteeServiceId = this.serviceIdToBytes(
+            detail.serviceId
+          );
+
+          update.selfInvitedOtherUserToGroupUpdate = innerUpdate;
+          updates.push(update);
+          return;
+        }
+
+        const innerUpdate = new Backups.GroupUnknownInviteeUpdate();
+        if (from) {
+          innerUpdate.inviterAci = this.serviceIdToBytes(from);
+        }
+        innerUpdate.inviteeCount = 1;
+
+        update.groupUnknownInviteeUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'pending-add-many') {
+        const innerUpdate = new Backups.GroupUnknownInviteeUpdate();
+        if (from) {
+          innerUpdate.inviterAci = this.serviceIdToBytes(from);
+        }
+        innerUpdate.inviteeCount = detail.count;
+
+        update.groupUnknownInviteeUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'pending-remove-one') {
+        if (from && detail.serviceId && from === detail.serviceId) {
+          const innerUpdate = new Backups.GroupInvitationDeclinedUpdate();
+          if (detail.inviter) {
+            innerUpdate.inviterAci = this.aciToBytes(detail.inviter);
+          }
+          if (isAciString(detail.serviceId)) {
+            innerUpdate.inviteeAci = this.aciToBytes(detail.serviceId);
+          }
+
+          update.groupInvitationDeclinedUpdate = innerUpdate;
+          updates.push(update);
+          return;
+        }
+        if (
+          (aboutMe.aci && detail.serviceId === aboutMe.aci) ||
+          (aboutMe.pni && detail.serviceId === aboutMe.pni)
+        ) {
+          const innerUpdate = new Backups.GroupSelfInvitationRevokedUpdate();
+          if (from) {
+            innerUpdate.revokerAci = this.serviceIdToBytes(from);
+          }
+
+          update.groupSelfInvitationRevokedUpdate = innerUpdate;
+          updates.push(update);
+          return;
+        }
+
+        const innerUpdate = new Backups.GroupInvitationRevokedUpdate();
+        if (from) {
+          innerUpdate.updaterAci = this.serviceIdToBytes(from);
+        }
+        innerUpdate.invitees = [
+          {
+            inviteeAci: isAciString(detail.serviceId)
+              ? this.aciToBytes(detail.serviceId)
+              : undefined,
+            inviteePni: isPniString(detail.serviceId)
+              ? this.serviceIdToBytes(detail.serviceId)
+              : undefined,
+          },
+        ];
+
+        update.groupInvitationRevokedUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'pending-remove-many') {
+        const innerUpdate = new Backups.GroupInvitationRevokedUpdate();
+        if (from) {
+          innerUpdate.updaterAci = this.serviceIdToBytes(from);
+        }
+
+        innerUpdate.invitees = [];
+        for (let i = 0, max = detail.count; i < max; i += 1) {
+          // Yes, we're adding totally empty invitees. This is okay.
+          innerUpdate.invitees.push({});
+        }
+
+        update.groupInvitationRevokedUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'admin-approval-add-one') {
+        const innerUpdate = new Backups.GroupJoinRequestUpdate();
+        innerUpdate.requestorAci = this.aciToBytes(detail.aci);
+
+        update.groupJoinRequestUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'admin-approval-remove-one') {
+        if (from && detail.aci && from === detail.aci) {
+          const innerUpdate = new Backups.GroupJoinRequestCanceledUpdate();
+          innerUpdate.requestorAci = this.aciToBytes(detail.aci);
+
+          update.groupJoinRequestCanceledUpdate = innerUpdate;
+          updates.push(update);
+          return;
+        }
+
+        const innerUpdate = new Backups.GroupJoinRequestApprovalUpdate();
+        if (from) {
+          innerUpdate.updaterAci = this.serviceIdToBytes(from);
+        }
+
+        innerUpdate.requestorAci = this.aciToBytes(detail.aci);
+        innerUpdate.wasApproved = false;
+
+        update.groupJoinRequestApprovalUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'admin-approval-bounce') {
+        // We can't express all we need in GroupSequenceOfRequestsAndCancelsUpdate, so we
+        //   add an additional groupJoinRequestUpdate to express that there
+        //   is an approval pending.
+        if (detail.isApprovalPending) {
+          const innerUpdate = new Backups.GroupJoinRequestUpdate();
+          innerUpdate.requestorAci = this.aciToBytes(detail.aci);
+
+          // We need to create another update since the items we put in Update are oneof
+          const secondUpdate = new Backups.GroupChangeChatUpdate.Update();
+          secondUpdate.groupJoinRequestUpdate = innerUpdate;
+          updates.push(secondUpdate);
+
+          // not returning because we really do want both of these
+        }
+
+        const innerUpdate =
+          new Backups.GroupSequenceOfRequestsAndCancelsUpdate();
+        innerUpdate.requestorAci = this.aciToBytes(detail.aci);
+        innerUpdate.count = detail.times;
+
+        update.groupSequenceOfRequestsAndCancelsUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'description') {
+        const innerUpdate = new Backups.GroupDescriptionUpdate();
+        innerUpdate.newDescription = detail.removed
+          ? undefined
+          : detail.description;
+        if (from) {
+          innerUpdate.updaterAci = this.serviceIdToBytes(from);
+        }
+
+        update.groupDescriptionUpdate = innerUpdate;
+        updates.push(update);
+      } else if (type === 'summary') {
+        const innerUpdate = new Backups.GenericGroupUpdate();
+        if (from) {
+          innerUpdate.updaterAci = this.serviceIdToBytes(from);
+        }
+
+        update.genericGroupUpdate = innerUpdate;
+        updates.push(update);
+      } else {
+        throw missingCaseError(type);
+      }
+    });
+
+    if (updates.length === 0) {
+      throw new Error(`${logId}: No updates generated from message`);
+    }
+
+    const groupUpdate = new Backups.GroupChangeChatUpdate();
+    groupUpdate.updates = updates;
+
+    return groupUpdate;
+  }
+
+  private async toQuote({
+    quote,
+    backupLevel,
+    messageReceivedAt,
+  }: {
+    quote?: QuotedMessageType;
+    backupLevel: BackupLevel;
+    messageReceivedAt: number;
+  }): Promise<Backups.IQuote | null> {
     if (!quote) {
       return null;
     }
-
-    const quotedMessage = await Data.getMessageById(quote.messageId);
 
     let authorId: Long;
     if (quote.authorAci) {
@@ -669,19 +1843,28 @@ export class BackupExportStream extends Readable {
     }
 
     return {
-      targetSentTimestamp:
-        quotedMessage && !quote.referencedMessageNotFound
-          ? Long.fromNumber(quotedMessage.sent_at)
-          : null,
+      targetSentTimestamp: Long.fromNumber(quote.id),
       authorId,
       text: quote.text,
-      attachments: quote.attachments.map((attachment: QuotedAttachment) => {
-        return {
-          contentType: attachment.contentType,
-          fileName: attachment.fileName,
-          thumbnail: null,
-        };
-      }),
+      attachments: await Promise.all(
+        quote.attachments.map(
+          async (
+            attachment: QuotedAttachmentType
+          ): Promise<Backups.Quote.IQuotedAttachment> => {
+            return {
+              contentType: attachment.contentType,
+              fileName: attachment.fileName,
+              thumbnail: attachment.thumbnail
+                ? await this.processMessageAttachment({
+                    attachment: attachment.thumbnail,
+                    backupLevel,
+                    messageReceivedAt,
+                  })
+                : undefined,
+            };
+          }
+        )
+      ),
       bodyRanges: quote.bodyRanges?.map(range => this.toBodyRange(range)),
       type: quote.isGiftBadge
         ? Backups.Quote.Type.GIFTBADGE
@@ -696,9 +1879,7 @@ export class BackupExportStream extends Readable {
 
       ...('mentionAci' in range
         ? {
-            mentionAci: Aci.parseFromServiceIdString(
-              range.mentionAci
-            ).getRawUuidBytes(),
+            mentionAci: this.aciToBytes(range.mentionAci),
           }
         : {
             // Numeric values are compatible between backup and message protos
@@ -706,4 +1887,337 @@ export class BackupExportStream extends Readable {
           }),
     };
   }
+
+  private getMessageAttachmentFlag(
+    attachment: AttachmentType
+  ): Backups.MessageAttachment.Flag {
+    if (isVoiceMessageAttachment(attachment)) {
+      return Backups.MessageAttachment.Flag.VOICE_MESSAGE;
+    }
+    if (isGIF([attachment])) {
+      return Backups.MessageAttachment.Flag.GIF;
+    }
+    if (
+      attachment.flags &&
+      // eslint-disable-next-line no-bitwise
+      attachment.flags & SignalService.AttachmentPointer.Flags.BORDERLESS
+    ) {
+      return Backups.MessageAttachment.Flag.BORDERLESS;
+    }
+
+    return Backups.MessageAttachment.Flag.NONE;
+  }
+
+  private async processMessageAttachment({
+    attachment,
+    backupLevel,
+    messageReceivedAt,
+  }: {
+    attachment: AttachmentType;
+    backupLevel: BackupLevel;
+    messageReceivedAt: number;
+  }): Promise<Backups.MessageAttachment> {
+    const { clientUuid } = attachment;
+    const filePointer = await this.processAttachment({
+      attachment,
+      backupLevel,
+      messageReceivedAt,
+    });
+
+    return new Backups.MessageAttachment({
+      pointer: filePointer,
+      flag: this.getMessageAttachmentFlag(attachment),
+      wasDownloaded: isDownloaded(attachment), // should always be true
+      clientUuid: clientUuid ? uuidToBytes(clientUuid) : undefined,
+    });
+  }
+
+  private async processAttachment({
+    attachment,
+    backupLevel,
+    messageReceivedAt,
+  }: {
+    attachment: AttachmentType;
+    backupLevel: BackupLevel;
+    messageReceivedAt: number;
+  }): Promise<Backups.FilePointer> {
+    const { filePointer, updatedAttachment } =
+      await getFilePointerForAttachment({
+        attachment,
+        backupLevel,
+        getBackupCdnInfo,
+      });
+
+    if (updatedAttachment) {
+      // TODO (DESKTOP-6688): ensure that we update the message/attachment in DB with the
+      // new keys so that we don't try to re-upload it again on the next export
+    }
+
+    const backupJob = await maybeGetBackupJobForAttachmentAndFilePointer({
+      attachment: updatedAttachment ?? attachment,
+      filePointer,
+      getBackupCdnInfo,
+      messageReceivedAt,
+    });
+
+    if (backupJob) {
+      this.attachmentBackupJobs.push(backupJob);
+    }
+
+    return filePointer;
+  }
+
+  private getMessageReactions({
+    reactions,
+  }: Pick<MessageAttributesType, 'reactions'>):
+    | Array<Backups.IReaction>
+    | undefined {
+    if (reactions == null) {
+      return undefined;
+    }
+
+    return reactions?.map((reaction, sortOrder) => {
+      return {
+        emoji: reaction.emoji,
+        authorId: this.getOrPushPrivateRecipient({
+          id: reaction.fromId,
+        }),
+        sentTimestamp: getSafeLongFromTimestamp(reaction.timestamp),
+        receivedTimestamp: getSafeLongFromTimestamp(
+          reaction.receivedAtDate ?? reaction.timestamp
+        ),
+        sortOrder: Long.fromNumber(sortOrder),
+      };
+    });
+  }
+
+  private getIncomingMessageDetails({
+    received_at_ms: receivedAtMs,
+    editMessageReceivedAtMs,
+    serverTimestamp,
+    readStatus,
+    unidentifiedDeliveryReceived,
+  }: Pick<
+    MessageAttributesType,
+    | 'received_at_ms'
+    | 'editMessageReceivedAtMs'
+    | 'serverTimestamp'
+    | 'readStatus'
+    | 'unidentifiedDeliveryReceived'
+  >): Backups.ChatItem.IIncomingMessageDetails {
+    const dateReceived = editMessageReceivedAtMs || receivedAtMs;
+    return {
+      dateReceived:
+        dateReceived != null ? getSafeLongFromTimestamp(dateReceived) : null,
+      dateServerSent:
+        serverTimestamp != null
+          ? getSafeLongFromTimestamp(serverTimestamp)
+          : null,
+      read: readStatus === ReadStatus.Read,
+      sealedSender: unidentifiedDeliveryReceived === true,
+    };
+  }
+
+  private getOutgoingMessageDetails(
+    sentAt: number,
+    {
+      sendStateByConversationId = {},
+      unidentifiedDeliveries = [],
+      errors = [],
+    }: Pick<
+      MessageAttributesType,
+      'sendStateByConversationId' | 'unidentifiedDeliveries' | 'errors'
+    >
+  ): Backups.ChatItem.IOutgoingMessageDetails {
+    const BackupSendStatus = Backups.SendStatus.Status;
+
+    const sealedSenderServiceIds = new Set(unidentifiedDeliveries);
+    const errorMap = new Map(
+      errors.map(({ serviceId, name }) => {
+        return [serviceId, name];
+      })
+    );
+
+    const sendStatus = new Array<Backups.ISendStatus>();
+    for (const [id, entry] of Object.entries(sendStateByConversationId)) {
+      const target = window.ConversationController.get(id);
+      if (!target) {
+        log.warn(`backups: no send target for a message ${sentAt}`);
+        continue;
+      }
+
+      let deliveryStatus: Backups.SendStatus.Status;
+      switch (entry.status) {
+        case SendStatus.Pending:
+          deliveryStatus = BackupSendStatus.PENDING;
+          break;
+        case SendStatus.Sent:
+          deliveryStatus = BackupSendStatus.SENT;
+          break;
+        case SendStatus.Delivered:
+          deliveryStatus = BackupSendStatus.DELIVERED;
+          break;
+        case SendStatus.Read:
+          deliveryStatus = BackupSendStatus.READ;
+          break;
+        case SendStatus.Viewed:
+          deliveryStatus = BackupSendStatus.VIEWED;
+          break;
+        case SendStatus.Failed:
+          deliveryStatus = BackupSendStatus.FAILED;
+          break;
+        default:
+          throw missingCaseError(entry.status);
+      }
+
+      const { serviceId } = target.attributes;
+      let networkFailure = false;
+      let identityKeyMismatch = false;
+      let sealedSender = false;
+      if (serviceId) {
+        const errorName = errorMap.get(serviceId);
+        if (errorName !== undefined) {
+          identityKeyMismatch = errorName === 'OutgoingIdentityKeyError';
+          networkFailure = !identityKeyMismatch;
+        }
+        sealedSender = sealedSenderServiceIds.has(serviceId);
+      }
+
+      sendStatus.push({
+        recipientId: this.getOrPushPrivateRecipient(target.attributes),
+        lastStatusUpdateTimestamp:
+          entry.updatedAt != null
+            ? getSafeLongFromTimestamp(entry.updatedAt)
+            : null,
+        deliveryStatus,
+        networkFailure,
+        identityKeyMismatch,
+        sealedSender,
+      });
+    }
+    return {
+      sendStatus,
+    };
+  }
+
+  private async toStandardMessage(
+    message: Pick<
+      MessageAttributesType,
+      | 'quote'
+      | 'attachments'
+      | 'body'
+      | 'bodyRanges'
+      | 'preview'
+      | 'reactions'
+      | 'received_at'
+    >,
+    backupLevel: BackupLevel
+  ): Promise<Backups.IStandardMessage> {
+    const isVoiceMessage = message.attachments?.some(isVoiceMessageAttachment);
+    const includeText = !isVoiceMessage;
+
+    return {
+      quote: await this.toQuote({
+        quote: message.quote,
+        backupLevel,
+        messageReceivedAt: message.received_at,
+      }),
+      attachments: message.attachments
+        ? await Promise.all(
+            message.attachments.map(attachment => {
+              return this.processMessageAttachment({
+                attachment,
+                backupLevel,
+                messageReceivedAt: message.received_at,
+              });
+            })
+          )
+        : undefined,
+      text: includeText
+        ? {
+            // TODO (DESKTOP-7207): handle long message text attachments
+            // Note that we store full text on the message model so we have to
+            // trim it before serializing.
+            body: message.body?.slice(0, LONG_ATTACHMENT_LIMIT),
+            bodyRanges: message.bodyRanges?.map(range =>
+              this.toBodyRange(range)
+            ),
+          }
+        : undefined,
+      linkPreview: message.preview
+        ? await Promise.all(
+            message.preview.map(async preview => {
+              return {
+                url: preview.url,
+                title: preview.title,
+                description: preview.description,
+                date: getSafeLongFromTimestamp(preview.date),
+                image: preview.image
+                  ? await this.processAttachment({
+                      attachment: preview.image,
+                      backupLevel,
+                      messageReceivedAt: message.received_at,
+                    })
+                  : undefined,
+              };
+            })
+          )
+        : undefined,
+      reactions: this.getMessageReactions(message),
+    };
+  }
+
+  private async toChatItemRevisions(
+    parent: Backups.IChatItem,
+    message: MessageAttributesType,
+    backupLevel: BackupLevel
+  ): Promise<Array<Backups.IChatItem> | undefined> {
+    const { editHistory } = message;
+    if (editHistory == null) {
+      return undefined;
+    }
+
+    const isOutgoing = message.type === 'outgoing';
+
+    return Promise.all(
+      editHistory
+        // The first history is the copy of the current message
+        .slice(1)
+        .map(async history => {
+          return {
+            // Required fields
+            chatId: parent.chatId,
+            authorId: parent.authorId,
+            dateSent: getSafeLongFromTimestamp(history.timestamp),
+            expireStartDate: parent.expireStartDate,
+            expiresInMs: parent.expiresInMs,
+            sms: parent.sms,
+
+            // Directional details
+            outgoing: isOutgoing
+              ? this.getOutgoingMessageDetails(history.timestamp, history)
+              : undefined,
+            incoming: isOutgoing
+              ? undefined
+              : this.getIncomingMessageDetails(history),
+
+            // Message itself
+            standardMessage: await this.toStandardMessage(history, backupLevel),
+          };
+
+          // Backups use oldest to newest order
+        })
+        .reverse()
+    );
+  }
+}
+
+function checkServiceIdEquivalence(
+  left: ServiceIdString | undefined,
+  right: ServiceIdString | undefined
+) {
+  const leftConvo = window.ConversationController.get(left);
+  const rightConvo = window.ConversationController.get(right);
+
+  return leftConvo && rightConvo && leftConvo === rightConvo;
 }

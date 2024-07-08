@@ -42,6 +42,13 @@ import {
   isDraftForwardable,
   type MessageForwardDraft,
 } from '../types/ForwardDraft';
+import { missingCaseError } from '../util/missingCaseError';
+import { Theme } from '../util/theme';
+
+export enum ForwardMessagesModalType {
+  Forward,
+  ShareCallLink,
+}
 
 export type DataPropsType = {
   candidateConversations: ReadonlyArray<ConversationType>;
@@ -52,6 +59,7 @@ export type DataPropsType = {
   drafts: ReadonlyArray<MessageForwardDraft>;
   getPreferredBadge: PreferredBadgeSelectorType;
   i18n: LocalizerType;
+  isInFullScreenCall: boolean;
 
   linkPreviewForSource: (
     source: LinkPreviewSourceType
@@ -63,6 +71,7 @@ export type DataPropsType = {
   ) => unknown;
   regionCode: string | undefined;
   RenderCompositionTextArea: ComponentType<SmartCompositionTextAreaProps>;
+  type: ForwardMessagesModalType;
   showToast: ShowToastAction;
   theme: ThemeType;
 };
@@ -76,12 +85,14 @@ export type PropsType = DataPropsType & ActionPropsType;
 const MAX_FORWARD = 5;
 
 export function ForwardMessagesModal({
+  type,
   drafts,
   candidateConversations,
   doForwardMessages,
   linkPreviewForSource,
   getPreferredBadge,
   i18n,
+  isInFullScreenCall,
   onClose,
   onChange,
   removeLinkPreview,
@@ -292,6 +303,17 @@ export function ForwardMessagesModal({
     </div>
   );
 
+  let title: string;
+  if (type === ForwardMessagesModalType.Forward) {
+    title = i18n('icu:ForwardMessageModal__title');
+  } else if (type === ForwardMessagesModalType.ShareCallLink) {
+    title = i18n('icu:ForwardMessageModal__ShareCallLink');
+  } else {
+    throw missingCaseError(type);
+  }
+
+  const modalTheme = isInFullScreenCall ? Theme.Dark : undefined;
+
   return (
     <>
       {cannotMessage && (
@@ -311,8 +333,9 @@ export function ForwardMessagesModal({
         onClose={onClose}
         onBackButtonClick={isEditingMessage ? handleBackOrClose : undefined}
         moduleClassName="module-ForwardMessageModal"
-        title={i18n('icu:ForwardMessageModal__title')}
-        useFocusTrap={false}
+        title={title}
+        theme={modalTheme}
+        useFocusTrap={isInFullScreenCall}
         padded={false}
         modalFooter={footer}
         noMouseClose
@@ -469,6 +492,7 @@ function ForwardMessageEditor({
       <RenderCompositionTextArea
         bodyRanges={draft.bodyRanges ?? null}
         draftText={draft.messageBody ?? ''}
+        isActive
         onChange={onChange}
         onSubmit={onSubmit}
         theme={theme}

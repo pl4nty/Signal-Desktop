@@ -16,8 +16,12 @@ import { getCountryCode } from './types/PhoneNumber';
 
 export type ConfigKeyType =
   | 'desktop.calling.adhoc'
+  | 'desktop.calling.adhoc.create'
+  | 'desktop.calling.raiseHand'
   | 'desktop.clientExpiration'
-  | 'desktop.groupMultiTypingIndicators'
+  | 'desktop.backup.credentialFetch'
+  | 'desktop.deleteSync.send'
+  | 'desktop.deleteSync.receive'
   | 'desktop.internalUser'
   | 'desktop.mediaQuality.levels'
   | 'desktop.messageCleanup'
@@ -26,6 +30,8 @@ export type ConfigKeyType =
   | 'desktop.senderKeyMaxAge'
   | 'desktop.experimentalTransportEnabled.alpha'
   | 'desktop.experimentalTransportEnabled.beta'
+  | 'desktop.experimentalTransportEnabled.prod'
+  | 'desktop.cdsiViaLibsignal'
   | 'global.attachments.maxBytes'
   | 'global.attachments.maxReceiveBytes'
   | 'global.calling.maxGroupCallRingSize'

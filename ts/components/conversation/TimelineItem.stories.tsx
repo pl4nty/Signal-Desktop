@@ -61,6 +61,7 @@ const getDefaultProps = () => ({
   isNextItemCallingNotification: false,
   isTargeted: false,
   isBlocked: false,
+  isGroup: false,
   interactionMode: 'keyboard' as const,
   theme: ThemeType.light,
   platform: 'darwin',
@@ -81,6 +82,7 @@ const getDefaultProps = () => ({
   showConversation: action('showConversation'),
   openGiftBadge: action('openGiftBadge'),
   saveAttachment: action('saveAttachment'),
+  onOpenEditNicknameAndNoteModal: action('onOpenEditNicknameAndNoteModal'),
   onOutgoingAudioCallInConversation: action(
     'onOutgoingAudioCallInConversation'
   ),

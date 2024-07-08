@@ -1,7 +1,7 @@
 // Copyright 2020 Signal Messenger, LLC
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import React, { memo, useMemo } from 'react';
+import React, { memo, useCallback, useMemo } from 'react';
 import { useSelector } from 'react-redux';
 import { ContactModal } from '../../components/conversation/ContactModal';
 import { getAreWeASubscriber } from '../selectors/items';
@@ -9,12 +9,16 @@ import { getIntl, getTheme } from '../selectors/user';
 import { getBadgesSelector } from '../selectors/badges';
 import { getConversationSelector } from '../selectors/conversations';
 import { getHasStoriesSelector } from '../selectors/stories2';
-import { getActiveCallState } from '../selectors/calling';
+import {
+  getActiveCallState,
+  isInFullScreenCall as getIsInFullScreenCall,
+} from '../selectors/calling';
 import { useStoriesActions } from '../ducks/stories';
 import { useConversationsActions } from '../ducks/conversations';
 import { useGlobalModalActions } from '../ducks/globalModals';
 import { useCallingActions } from '../ducks/calling';
 import { getContactModalState } from '../selectors/globalModals';
+import { strictAssert } from '../../util/assert';
 
 export const SmartContactModal = memo(function SmartContactModal() {
   const i18n = useSelector(getIntl);
@@ -23,6 +27,7 @@ export const SmartContactModal = memo(function SmartContactModal() {
   const conversationSelector = useSelector(getConversationSelector);
   const hasStoriesSelector = useSelector(getHasStoriesSelector);
   const activeCallState = useSelector(getActiveCallState);
+  const isInFullScreenCall = useSelector(getIsInFullScreenCall);
   const badgesSelector = useSelector(getBadgesSelector);
   const areWeASubscriber = useSelector(getAreWeASubscriber);
 
@@ -56,11 +61,18 @@ export const SmartContactModal = memo(function SmartContactModal() {
     toggleAddUserToAnotherGroupModal,
     toggleSafetyNumberModal,
     hideContactModal,
+    toggleEditNicknameAndNoteModal,
   } = useGlobalModalActions();
   const {
     onOutgoingVideoCallInConversation,
     onOutgoingAudioCallInConversation,
+    togglePip,
   } = useCallingActions();
+
+  const handleOpenEditNicknameAndNoteModal = useCallback(() => {
+    strictAssert(contactId != null, 'Expected conversationId to be set');
+    toggleEditNicknameAndNoteModal({ conversationId: contactId });
+  }, [toggleEditNicknameAndNoteModal, contactId]);
 
   return (
     <ContactModal
@@ -75,7 +87,9 @@ export const SmartContactModal = memo(function SmartContactModal() {
       hideContactModal={hideContactModal}
       i18n={i18n}
       isAdmin={isAdmin}
+      isInFullScreenCall={isInFullScreenCall}
       isMember={isMember}
+      onOpenEditNicknameAndNoteModal={handleOpenEditNicknameAndNoteModal}
       onOutgoingAudioCallInConversation={onOutgoingAudioCallInConversation}
       onOutgoingVideoCallInConversation={onOutgoingVideoCallInConversation}
       removeMemberFromGroup={removeMemberFromGroup}
@@ -84,6 +98,7 @@ export const SmartContactModal = memo(function SmartContactModal() {
       toggleAboutContactModal={toggleAboutContactModal}
       toggleAddUserToAnotherGroupModal={toggleAddUserToAnotherGroupModal}
       toggleAdmin={toggleAdmin}
+      togglePip={togglePip}
       toggleSafetyNumberModal={toggleSafetyNumberModal}
       updateConversationModelSharedGroups={updateConversationModelSharedGroups}
       viewUserStories={viewUserStories}

@@ -52,6 +52,7 @@ import { isNotNil } from '../util/isNotNil';
 import * as log from '../logging/log';
 import * as Errors from '../types/errors';
 import { useRefMerger } from '../hooks/useRefMerger';
+import { useEmojiSearch } from '../hooks/useEmojiSearch';
 import type { LinkPreviewType } from '../types/message/LinkPreviews';
 import { StagedLinkPreview } from './conversation/StagedLinkPreview';
 import type { DraftEditMessageType } from '../model-types.d';
@@ -104,6 +105,7 @@ export type Props = Readonly<{
   large: boolean | null;
   inputApi: React.MutableRefObject<InputApi | undefined> | null;
   isFormattingEnabled: boolean;
+  isActive: boolean;
   sendCounter: number;
   skinTone: NonNullable<EmojiPickDataType['skinTone']> | null;
   draftText: string | null;
@@ -157,6 +159,7 @@ export function CompositionInput(props: Props): React.ReactElement {
     i18n,
     inputApi,
     isFormattingEnabled,
+    isActive,
     large,
     linkPreviewLoading,
     linkPreviewResult,
@@ -408,8 +411,13 @@ export function CompositionInput(props: Props): React.ReactElement {
     isMouseDown,
     previousFormattingEnabled,
     previousIsMouseDown,
-    quillRef,
   ]);
+
+  React.useEffect(() => {
+    quillRef.current?.getModule('signalClipboard').updateOptions({
+      isDisabled: !isActive,
+    });
+  }, [isActive]);
 
   const onEnter = (): boolean => {
     const quill = quillRef.current;
@@ -688,6 +696,8 @@ export function CompositionInput(props: Props): React.ReactElement {
   const callbacksRef = React.useRef(unstaleCallbacks);
   callbacksRef.current = unstaleCallbacks;
 
+  const search = useEmojiSearch(i18n.getLocale());
+
   const reactQuill = React.useMemo(
     () => {
       const delta = generateDelta(draftText || '', draftBodyRanges || []);
@@ -699,7 +709,9 @@ export function CompositionInput(props: Props): React.ReactElement {
           defaultValue={delta}
           modules={{
             toolbar: false,
-            signalClipboard: true,
+            signalClipboard: {
+              isDisabled: !isActive,
+            },
             clipboard: {
               matchers: [
                 ['IMG', matchEmojiImage],
@@ -739,6 +751,7 @@ export function CompositionInput(props: Props): React.ReactElement {
               onPickEmoji: (emoji: EmojiPickDataType) =>
                 callbacksRef.current.onPickEmoji(emoji),
               skinTone,
+              search,
             },
             autoSubstituteAsciiEmojis: {
               skinTone,
